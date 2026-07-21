@@ -102,8 +102,8 @@ unattended; switching to notify-only is one line
 
 | # | Risk | Probe | Result |
 |---|---|---|---|
-| 1 | StopFailure may not fire in headless `-p` sessions | user-settings logger hook + `claude -p --model <bogus>` (`model_not_found` is the same event, free) | *(pending)* |
-| 2 | plugin.json matcher syntax for StopFailure | register + `/hooks` inspection / debug log | *(pending)* |
+| 1 | StopFailure may not fire in headless `-p` sessions | user-settings logger hook + `claude -p --model <bogus>` (`model_not_found` is the same event, free) | **CONFIRMED FIRES** (2026-07-21): logged `{"hook_event_name":"StopFailure","error":"model_not_found",session_id,cwd}` from a headless run. The `run` wrapper fallback was dropped from v1 as dead weight. |
+| 2 | plugin.json matcher syntax for StopFailure | register + `/hooks` inspection / debug log | Defense-in-depth: the catcher guards on `error=="rate_limit"` itself, so behavior is correct even if the matcher fails to narrow; registration visually confirmed at first install (SessionStart banner + `/hooks`). |
 | 3 | Reset-message formats vary | fixture corpus incl. live-observed no-timestamp variant | parser defaults safe |
 | 4 | `--resume` while the dead TUI still holds the session | document: stale TUI after carry-on resume; re-resume to see the continued transcript | accepted |
 

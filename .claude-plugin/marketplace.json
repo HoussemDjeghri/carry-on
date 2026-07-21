@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "houssem-plugins",
+  "description": "Claude Code plugins by Houssem Djeghri.",
+  "owner": {
+    "name": "Houssem Djeghri",
+    "url": "https://github.com/HoussemDjeghri"
+  },
+  "plugins": [
+    {
+      "name": "carry-on",
+      "description": "Auto-resume Claude Code sessions after a usage-limit reset: hook-native, no daemon, no keystrokes.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

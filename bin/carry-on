@@ -1,0 +1,121 @@
+#!/bin/bash
+# carry-on CLI: inspect and steer the auto-resume state.
+set -u
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$ROOT/lib/common.sh"
+
+die() { echo "carry-on: $*" >&2; exit 1; }
+
+banner() {
+  if [ "$(cfg_enabled)" = "true" ]; then
+    echo "CARRY-ON ACTIVE — mode: $(cfg_mode)"
+  else
+    echo "carry-on DISABLED"
+  fi
+}
+
+cmd_status() {
+  ensure_dirs
+  banner
+  local files
+  files=$(ls "$PENDING_DIR"/*.json 2>/dev/null || true)
+  if [ -n "$files" ]; then
+    echo
+    echo "pending wakes:"
+    printf '  %-10s %-20s %-8s %-7s %s\n' session project caught wake chain
+    local f id cwd caught reset chain wake
+    for f in $files; do
+      id=$(jq -r '.session_id' "$f")
+      cwd=$(jq -r '.cwd' "$f")
+      caught=$(jq -r '.caught_at' "$f")
+      reset=$(jq -r '.reset_epoch // empty' "$f")
+      chain=$(jq -r '.chain' "$f")
+      wake=${reset:+$(fmt_time "$reset")}
+      printf '  %-10s %-20s %-8s %-7s %s\n' \
+        "${id:0:8}" "$(basename "$cwd")" "$(fmt_time "$caught")" "${wake:-retry}" "$chain"
+    done
+  else
+    echo "no pending wakes"
+  fi
+  if [ -f "$HISTORY_FILE" ]; then
+    echo
+    echo "recent:"
+    tail -5 "$HISTORY_FILE" | jq -r '"  \(.ts | tostring | .[0:10]) \(.event) \(.session_id[0:8]) \(.cwd | split("/") | last // "")"' 2>/dev/null || true
+  fi
+}
+
+cmd_cancel() {
+  local target="${1:-}"
+  [ -n "$target" ] || die "usage: carry-on cancel <session-id-prefix|all>"
+  ensure_dirs
+  if [ "$target" = "all" ]; then
+    rm -f "$PENDING_DIR"/*.json
+    echo "cancelled all pending wakes"
+  else
+    local hit=0 f
+    for f in "$PENDING_DIR"/*.json; do
+      [ -f "$f" ] || continue
+      case "$(basename "$f")" in "$target"*) rm -f "$f"; hit=1 ;; esac
+    done
+    [ "$hit" = 1 ] && echo "cancelled $target" || die "no pending wake matches '$target'"
+  fi
+  # Last pending gone -> the sleeper notices on its next slice and exits;
+  # kill it now if we can, so nothing lingers.
+  if [ -z "$(ls "$PENDING_DIR"/*.json 2>/dev/null)" ] && [ -f "$LOCK_DIR/pid" ]; then
+    kill "$(cat "$LOCK_DIR/pid")" 2>/dev/null || true
+    rm -rf "$LOCK_DIR"
+  fi
+}
+
+cmd_log() {
+  ensure_dirs
+  local prefix="${1:-}" f
+  if [ -n "$prefix" ]; then
+    f=$(ls -t "$LOGS_DIR/$prefix"*.log 2>/dev/null | head -1)
+  else
+    f=$(ls -t "$LOGS_DIR"/*.log 2>/dev/null | head -1)
+  fi
+  [ -n "$f" ] || die "no resume logs${prefix:+ matching '$prefix'}"
+  echo "── $f"
+  tail -40 "$f"
+}
+
+cmd_config() {
+  local key="${1:-}" value="${2:-}"
+  if [ -z "$key" ]; then
+    banner
+    for k in mode max_chain max_wait probe_model deny; do
+      echo "$k=$(config_get "$k" "$(case $k in mode) echo resume;; max_chain) echo 3;; max_wait) echo 604800;; probe_model) echo haiku;; *) echo '';; esac)")"
+    done
+    return
+  fi
+  [ -n "$value" ] || die "usage: carry-on config <key> <value>"
+  case "$key" in
+    mode) case "$value" in resume|notify) ;; *) die "mode is resume|notify" ;; esac ;;
+    enabled|max_chain|max_wait|probe_model|deny|resume_prompt) ;;
+    *) die "unknown key '$key' (enabled mode resume_prompt max_chain max_wait probe_model deny)" ;;
+  esac
+  config_set "$key" "$value"
+  echo "$key=$value"
+}
+
+case "${1:-help}" in
+  status)  cmd_status ;;
+  cancel)  shift; cmd_cancel "$@" ;;
+  on)      config_set enabled true;  echo "carry-on enabled" ;;
+  off)     config_set enabled false; echo "carry-on disabled (pending wakes kept; carry-on cancel all to drop them)" ;;
+  log)     shift; cmd_log "$@" ;;
+  config)  shift; cmd_config "$@" ;;
+  help|--help|-h)
+    cat <<'EOF'
+carry-on — auto-resume Claude Code sessions after usage-limit resets
+  carry-on status              pending wakes + recent history
+  carry-on cancel <id|all>     drop pending wake(s)
+  carry-on on|off              enable / disable catching
+  carry-on config [key value]  show or set config (mode=resume|notify, ...)
+  carry-on log [id-prefix]     tail a resume log
+EOF
+    ;;
+  *) die "unknown command '$1' (try: carry-on help)" ;;
+esac

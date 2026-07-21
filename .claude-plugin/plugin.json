@@ -1,0 +1,34 @@
+{
+  "name": "carry-on",
+  "version": "0.1.0",
+  "description": "Auto-resume Claude Code sessions after a usage-limit reset: hook-native detection, no daemon, no polling, no keystroke injection.",
+  "author": {
+    "name": "Houssem Djeghri"
+  },
+  "hooks": {
+    "StopFailure": [
+      {
+        "matcher": "rate_limit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/stop-failure.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh\"",
+            "timeout": 5,
+            "statusMessage": "Checking carry-on state..."
+          }
+        ]
+      }
+    ]
+  }
+}
