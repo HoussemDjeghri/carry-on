@@ -1,5 +1,6 @@
 ---
-description: Cancel pending carry-on wake(s) — argument: session-id prefix or "all"
+description: Cancel pending carry-on wake(s)
+argument-hint: <session-id-prefix|all>
 ---
 
 Run `"${CLAUDE_PLUGIN_ROOT}/bin/carry-on" cancel $ARGUMENTS` with the Bash

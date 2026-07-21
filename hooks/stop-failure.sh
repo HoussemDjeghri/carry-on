@@ -1,8 +1,9 @@
 #!/bin/bash
 # The catcher. Registered on the StopFailure hook (matcher: rate_limit).
-# Reads the event payload on stdin, records a pending resume, and spawns the
-# sleeper. Hook output is ignored by Claude Code, so this script only has
-# side effects. It must never block a dying session: every guard exits 0.
+# Reads the event payload on stdin, records a pending resume, and ensures a
+# sleeper is running. Hook output is ignored by Claude Code, so this script
+# only has side effects. It must never block a dying session: every guard
+# exits 0.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=../lib/common.sh
@@ -15,9 +16,12 @@ session_id=$(printf '%s' "$payload" | jq -r '.session_id // empty')
 cwd=$(printf '%s' "$payload" | jq -r '.cwd // empty')
 pmode=$(printf '%s' "$payload" | jq -r '.permission_mode // "default"')
 error=$(printf '%s' "$payload" | jq -r '.error // empty')
-message=$(printf '%s' "$payload" | jq -r '((.last_assistant_message // "") + " " + (.error_details // ""))')
+details=$(printf '%s' "$payload" | jq -r '.error_details // empty')
+message=$(printf '%s' "$payload" | jq -r '.last_assistant_message // empty')
 
 [ -n "$session_id" ] || exit 0
+# The id builds file paths and argv below — accept only sane characters.
+case "$session_id" in *[!A-Za-z0-9._-]*) exit 0 ;; esac
 # Script-side guard so behavior stays correct even if the hook was
 # registered without the rate_limit matcher.
 [ "$error" = "rate_limit" ] || exit 0
@@ -38,35 +42,35 @@ fi
 
 ensure_dirs
 
-# Chain cap: this session has already been carried on max_chain times.
+# Chain cap: this session has been carried on max_chain times already.
+# Per the advertised behavior it degrades to notify-only, not to silence —
+# the pending still tracks the reset so the user hears when the window lifts.
+notify_only=false
 if [ "$(chain_count "$session_id")" -ge "$(cfg_max_chain)" ]; then
+  notify_only=true
   history_append exhausted "$session_id" "$cwd"
-  notify "carry-on: session ${session_id:0:8} hit the limit again after $(cfg_max_chain) resumes — exhausted, not resuming. carry-on status"
-  exit 0
+  notify "carry-on: session ${session_id:0:8} hit the limit again after $(cfg_max_chain) resumes — switching to notify-only for it"
 fi
 
-reset_epoch=$(parse_reset_epoch "$message")
+# The structured error detail is authoritative; assistant prose is the
+# fallback only — a final message that happens to discuss reset times must
+# not outrank the API's own text.
+reset_epoch=$(parse_reset_epoch "$details")
+[ -z "$reset_epoch" ] && reset_epoch=$(parse_reset_epoch "$message")
+
+tmp="$PENDING_DIR/.$session_id.tmp.$$"
 jq -cn \
   --arg id "$session_id" --arg cwd "$cwd" --arg pm "$pmode" \
-  --arg snippet "${message:0:120}" \
   --argjson reset "${reset_epoch:-null}" \
   --argjson chain "$(chain_count "$session_id")" \
+  --argjson notify_only "$notify_only" \
   --argjson t "$(now_epoch)" \
   '{session_id:$id, cwd:$cwd, permission_mode:$pm, reset_epoch:$reset,
-    chain:$chain, caught_at:$t, error_snippet:$snippet}' \
-  > "$PENDING_DIR/$session_id.json"
+    chain:$chain, caught_at:$t, retries:0, notify_only:$notify_only}' \
+  > "$tmp" && mv "$tmp" "$PENDING_DIR/$session_id.json"
 
 history_append caught "$session_id" "$cwd"
-
-# One sleeper serves all pending files; mkdir is the atomic test-and-set.
-if mkdir "$LOCK_DIR" 2>/dev/null; then
-  echo $$ > "$LOCK_DIR/spawner"
-  (setsid nohup "$ROOT/lib/sleeper.sh" >> "$CARRY_ON_HOME/sleeper.log" 2>&1 &)
-elif [ -f "$LOCK_DIR/pid" ] && ! kill -0 "$(cat "$LOCK_DIR/pid")" 2>/dev/null; then
-  # Stale lock (sleeper died); take over.
-  rm -rf "$LOCK_DIR"
-  mkdir "$LOCK_DIR" 2>/dev/null && (setsid nohup "$ROOT/lib/sleeper.sh" >> "$CARRY_ON_HOME/sleeper.log" 2>&1 &)
-fi
+ensure_sleeper "$ROOT"
 
 if [ -n "$reset_epoch" ]; then
   notify "carry-on: usage limit hit — will resume ~$(fmt_time "$reset_epoch")"

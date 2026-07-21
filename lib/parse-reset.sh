@@ -20,11 +20,27 @@ _epoch_today_at() { # _epoch_today_at HOUR MINUTE
     || date -d "$d $1:$2" +%s 2>/dev/null
 }
 
-_epoch_iso() { # _epoch_iso "YYYY-MM-DDTHH:MM[:SS]"
-  local iso="$1"
-  date -j -f "%Y-%m-%dT%H:%M:%S" "${iso:0:19}" +%s 2>/dev/null \
-    || date -j -f "%Y-%m-%dT%H:%M" "${iso:0:16}" +%s 2>/dev/null \
-    || date -d "$iso" +%s 2>/dev/null
+_epoch_iso() { # _epoch_iso "YYYY-MM-DDTHH:MM[:SS][Z|±HH[:]MM]"
+  local iso="$1" zone="" base epoch offset sign zh zm
+  zone=$(printf '%s' "$iso" | grep -oE '(Z|[+-][0-9]{2}:?[0-9]{2})$' || true)
+  base=${iso%"$zone"}
+  [ ${#base} -eq 16 ] && base="$base:00"
+  if [ -n "$zone" ]; then
+    # Zoned timestamp: interpret the clock fields as UTC, then shift by the
+    # stated offset. Dropping the zone would mis-sleep by the UTC offset.
+    epoch=$(date -ju -f "%Y-%m-%dT%H:%M:%S" "${base:0:19}" +%s 2>/dev/null \
+      || date -ud "${base:0:19}" +%s 2>/dev/null)
+    [ -z "$epoch" ] && return 0
+    if [ "$zone" != "Z" ]; then
+      sign=${zone:0:1}; zh=$((10#${zone:1:2})); zm=$(printf '%s' "$zone" | grep -oE '[0-9]{2}$')
+      offset=$(( zh * 3600 + 10#$zm * 60 ))
+      if [ "$sign" = "+" ]; then epoch=$((epoch - offset)); else epoch=$((epoch + offset)); fi
+    fi
+    printf '%s' "$epoch"
+    return 0
+  fi
+  date -j -f "%Y-%m-%dT%H:%M:%S" "${base:0:19}" +%s 2>/dev/null \
+    || date -d "$base" +%s 2>/dev/null
 }
 
 parse_reset_epoch() { # parse_reset_epoch TEXT
@@ -32,9 +48,9 @@ parse_reset_epoch() { # parse_reset_epoch TEXT
   lower=$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')
   now=$(date +%s)
 
-  # ISO timestamp anywhere in the text.
+  # ISO timestamp anywhere in the text (zone captured — it matters).
   local iso
-  iso=$(printf '%s' "$text" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?' | head -1)
+  iso=$(printf '%s' "$text" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?(Z|[+-][0-9]{2}:?[0-9]{2})?' | head -1)
   if [ -n "$iso" ]; then
     epoch=$(_epoch_iso "$iso")
     [ -n "$epoch" ] && { printf '%s' "$epoch"; return 0; }
@@ -48,6 +64,9 @@ parse_reset_epoch() { # parse_reset_epoch TEXT
   h=$(printf '%s' "$match" | grep -oE '[0-9]{1,2}(:[0-9]{2})?' | head -1 | cut -d: -f1)
   m=$(printf '%s' "$match" | grep -oE ':[0-9]{2}' | head -1 | tr -d :)
   m=${m:-00}
+  # Force base 10: "09" would otherwise be read as invalid octal by both
+  # $(( )) and printf %02d, corrupting the hour or aborting the parse.
+  h=$((10#$h)); m=$((10#$m))
   ampm=$(printf '%s' "$match" | grep -oE '(am|pm)$' || true)
 
   case "$ampm" in
@@ -59,9 +78,16 @@ parse_reset_epoch() { # parse_reset_epoch TEXT
         : ;;
   esac
 
-  epoch=$(_epoch_today_at "$(printf '%02d' "$h")" "$m")
+  epoch=$(_epoch_today_at "$(printf '%02d' "$h")" "$(printf '%02d' "$m")")
   [ -z "$epoch" ] && return 0
-  # A clock time already behind us means tomorrow's occurrence.
-  [ "$epoch" -le "$now" ] && epoch=$((epoch + 86400))
+  if [ "$epoch" -le "$now" ]; then
+    if [ $((now - epoch)) -le 300 ]; then
+      # The stated minute just passed (hooks fire seconds late): the reset
+      # is imminent, not tomorrow — a +86400 here would oversleep a day.
+      epoch=$((now + 60))
+    else
+      epoch=$((epoch + 86400))
+    fi
+  fi
   printf '%s' "$epoch"
 }

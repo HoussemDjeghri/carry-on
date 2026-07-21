@@ -18,30 +18,32 @@ banner() {
 cmd_status() {
   ensure_dirs
   banner
-  local files
-  files=$(ls "$PENDING_DIR"/*.json 2>/dev/null || true)
-  if [ -n "$files" ]; then
-    echo
-    echo "pending wakes:"
-    printf '  %-10s %-20s %-8s %-7s %s\n' session project caught wake chain
-    local f id cwd caught reset chain wake
-    for f in $files; do
-      id=$(jq -r '.session_id' "$f")
-      cwd=$(jq -r '.cwd' "$f")
-      caught=$(jq -r '.caught_at' "$f")
-      reset=$(jq -r '.reset_epoch // empty' "$f")
-      chain=$(jq -r '.chain' "$f")
-      wake=${reset:+$(fmt_time "$reset")}
-      printf '  %-10s %-20s %-8s %-7s %s\n' \
-        "${id:0:8}" "$(basename "$cwd")" "$(fmt_time "$caught")" "${wake:-retry}" "$chain"
-    done
-  else
-    echo "no pending wakes"
-  fi
+  # Status doubles as a recovery point for stranded pendings (post-reboot).
+  ensure_sleeper "$ROOT"
+  local any=0 f id cwd caught reset chain wake
+  for f in "$PENDING_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    if [ "$any" = 0 ]; then
+      echo
+      echo "pending wakes:"
+      printf '  %-10s %-20s %-8s %-7s %s\n' session project caught wake chain
+      any=1
+    fi
+    id=$(jq -r '.session_id // "?"' "$f")
+    cwd=$(jq -r '.cwd // ""' "$f")
+    caught=$(jq -r '.caught_at // 0' "$f")
+    reset=$(jq -r '.reset_epoch // empty' "$f")
+    chain=$(jq -r '.chain // 0' "$f")
+    wake=${reset:+$(fmt_time "$reset")}
+    printf '  %-10s %-20s %-8s %-7s %s\n' \
+      "${id:0:8}" "$(basename "$cwd")" "$(fmt_time "$caught")" "${wake:-retry}" "$chain"
+  done
+  [ "$any" = 0 ] && echo "no pending wakes"
   if [ -f "$HISTORY_FILE" ]; then
     echo
     echo "recent:"
-    tail -5 "$HISTORY_FILE" | jq -r '"  \(.ts | tostring | .[0:10]) \(.event) \(.session_id[0:8]) \(.cwd | split("/") | last // "")"' 2>/dev/null || true
+    jq -cR 'fromjson? // empty' "$HISTORY_FILE" 2>/dev/null | tail -5 \
+      | jq -r '"  \(.ts | tostring | .[0:10]) \(.event) \(.session_id[0:8]) \(.cwd | split("/") | last // "")"' 2>/dev/null || true
   fi
 }
 
@@ -58,12 +60,17 @@ cmd_cancel() {
       [ -f "$f" ] || continue
       case "$(basename "$f")" in "$target"*) rm -f "$f"; hit=1 ;; esac
     done
-    [ "$hit" = 1 ] && echo "cancelled $target" || die "no pending wake matches '$target'"
+    [ "$hit" = 1 ] || die "no pending wake matches '$target'"
+    echo "cancelled $target"
   fi
   # Last pending gone -> the sleeper notices on its next slice and exits;
-  # kill it now if we can, so nothing lingers.
-  if [ -z "$(ls "$PENDING_DIR"/*.json 2>/dev/null)" ] && [ -f "$LOCK_DIR/pid" ]; then
-    kill "$(cat "$LOCK_DIR/pid")" 2>/dev/null || true
+  # kill it now if we can, so nothing lingers. Children too (an in-flight
+  # resume would otherwise survive the cancel).
+  if ! pending_exists && [ -f "$LOCK_DIR/pid" ]; then
+    local spid
+    spid=$(cat "$LOCK_DIR/pid")
+    pkill -P "$spid" 2>/dev/null || true
+    kill "$spid" 2>/dev/null || true
     rm -rf "$LOCK_DIR"
   fi
 }
@@ -81,20 +88,34 @@ cmd_log() {
   tail -40 "$f"
 }
 
+_default_for() { # bash-3.2-safe defaults lookup (no case inside $())
+  case "$1" in
+    mode) echo resume ;;
+    max_chain) echo 3 ;;
+    max_wait) echo 604800 ;;
+    probe_model) echo haiku ;;
+    daily_cap) echo 12 ;;
+    resume_default_mode) echo acceptEdits ;;
+    *) echo "" ;;
+  esac
+}
+
 cmd_config() {
   local key="${1:-}" value="${2:-}"
   if [ -z "$key" ]; then
     banner
-    for k in mode max_chain max_wait probe_model deny; do
-      echo "$k=$(config_get "$k" "$(case $k in mode) echo resume;; max_chain) echo 3;; max_wait) echo 604800;; probe_model) echo haiku;; *) echo '';; esac)")"
+    local k
+    for k in mode max_chain max_wait probe_model daily_cap resume_default_mode deny; do
+      echo "$k=$(config_get "$k" "$(_default_for "$k")")"
     done
     return
   fi
   [ -n "$value" ] || die "usage: carry-on config <key> <value>"
   case "$key" in
     mode) case "$value" in resume|notify) ;; *) die "mode is resume|notify" ;; esac ;;
-    enabled|max_chain|max_wait|probe_model|deny|resume_prompt) ;;
-    *) die "unknown key '$key' (enabled mode resume_prompt max_chain max_wait probe_model deny)" ;;
+    resume_default_mode) case "$value" in acceptEdits|skip) ;; *) die "resume_default_mode is acceptEdits|skip" ;; esac ;;
+    enabled|max_chain|max_wait|probe_model|daily_cap|deny|resume_prompt) ;;
+    *) die "unknown key '$key' (enabled mode resume_prompt max_chain max_wait probe_model daily_cap resume_default_mode deny)" ;;
   esac
   config_set "$key" "$value"
   echo "$key=$value"

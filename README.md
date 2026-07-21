@@ -117,11 +117,20 @@ automatic resume.
   death and its resume, then exits. Uninstall leaves nothing running.
 - **Never types into terminals.** Resumes are headless `claude --resume`
   child processes; your panes are never touched.
-- **Never escalates permissions.** A session that ran with
-  `bypassPermissions` is resumed at `acceptEdits`, not bypass. Plan-mode
-  sessions are never auto-resumed — that's a human mid-decision.
-- **Loop-proof.** A resumed session that hits the limit again is re-caught
-  with a chain counter; after 3 resumes it goes notify-only.
+- **Permission posture, stated precisely.** A `bypassPermissions` session is
+  resumed at `acceptEdits`, never bypass. Plan-mode sessions are never
+  auto-resumed — that's a human mid-decision. A **default-mode** session
+  (prompts before each edit) is resumed at `acceptEdits` so the resume can
+  actually work unattended — that IS a step up from what you were running,
+  disclosed here on purpose; set
+  `carry-on config resume_default_mode skip` to have those sessions
+  notify-only instead. Headless `acceptEdits` still auto-approves only
+  edits and basic file commands — arbitrary Bash still has no approver and
+  doesn't run.
+- **Loop-proof, twice.** A resumed session that hits the limit again is
+  re-caught with a chain counter; after 3 resumes it goes notify-only. And
+  a global daily cap (default 12 resumes/day, `daily_cap`) bounds total
+  unattended spend across ALL sessions.
 - **Deny list.** `carry-on config deny "$HOME/sensitive*:$HOME/other*"`
   keeps chosen projects out entirely.
 - All state is plain files under `~/.claude/carry-on/` — read them any time.
@@ -131,7 +140,8 @@ automatic resume.
 
 `carry-on config` shows current values. Keys: `enabled` · `mode`
 (resume|notify) · `resume_prompt` · `max_chain` (3) · `max_wait` (seconds,
-default 7 days) · `probe_model` (haiku) · `deny` (colon-separated globs).
+default 7 days) · `probe_model` (haiku) · `daily_cap` (12) ·
+`resume_default_mode` (acceptEdits|skip) · `deny` (colon-separated globs).
 
 ## Limits of scope
 
