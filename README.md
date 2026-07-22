@@ -7,7 +7,7 @@
 
 <p>
   <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-D97757">
-  <img alt="version 0.1.0" src="https://img.shields.io/badge/version-0.1.0-191919">
+  <img alt="version 0.1.1" src="https://img.shields.io/badge/version-0.1.1-191919">
   <img alt="dependencies: bash and jq" src="https://img.shields.io/badge/deps-bash%20%2B%20jq-D4A27F">
   <img alt="no daemon" src="https://img.shields.io/badge/no-daemon-555">
 </p>
@@ -63,6 +63,21 @@ Restart your sessions so the hooks register. Every session then shows:
 CARRY-ON ACTIVE — mode: resume (auto-resumes this session when a usage limit resets; 'carry-on off' to disable)
 ```
 
+That banner is a log line — it scrolls away. On first session carry-on
+offers to wire an **always-visible statusline badge**: `[● CARRY-ON]` in
+every session where auto-resume is armed, turning into
+`[● CARRY-ON — waiting for reset]` if that session hits the limit and is
+queued to wake. The badge is per-session — it shows only where carry-on is
+actually armed, nothing in other sessions. Accept the offer, or run
+`/carry-on:statusline` anytime. Setup copies the shipped badge script to
+`~/.claude/hooks/carry-on-statusline.sh` and chains it from your
+`statusLine` command — created if you have none, appended if you already
+run your own script.
+
+Optional on macOS: `brew install terminal-notifier` upgrades desktop
+notifications (proper app attribution instead of Script Editor's "Show"
+button).
+
 ## How it works
 
 1. **Catch.** A turn dies on `rate_limit` → the `StopFailure` hook hands
@@ -95,6 +110,7 @@ carry-on: session f34907ab in this project was resumed after a limit reset — c
 | `/carry-on:status` (or `carry-on status`) | Pending wakes + recent history |
 | `/carry-on:cancel <id\|all>` | Drop pending wake(s) |
 | `/carry-on:on` / `/carry-on:off` | Enable / disable catching |
+| `/carry-on:statusline` | Wire the always-visible statusline badge |
 | `carry-on config mode notify` | Switch to notify-only (no auto-resume) |
 | `carry-on log [id-prefix]` | Tail a resume's output log |
 

@@ -15,10 +15,33 @@ payload=$(cat 2>/dev/null || true)
 cwd=$(printf '%s' "$payload" | jq -r '.cwd // empty' 2>/dev/null)
 [ -n "$cwd" ] || cwd=$(pwd)
 
+# Per-session marker for the statusline badge: the badge renders only in
+# sessions where this hook actually ran — not from leftover state after an
+# uninstall, and not in sessions of another setup. Same charset guard as the
+# catcher (the id becomes a filename). Markers expire with the transcript
+# retention default; the prune keeps the dir from growing forever.
+session_id=$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null)
+case "$session_id" in *[!A-Za-z0-9._-]*) session_id="" ;; esac
+if [ -n "$session_id" ] && [ "$(cfg_enabled)" = "true" ]; then
+  ensure_dirs
+  : > "$SESSIONS_DIR/$session_id"
+  find "$SESSIONS_DIR" -type f -mtime +30 -delete 2>/dev/null || true
+fi
+
 if [ "$(cfg_enabled)" = "true" ]; then
   echo "CARRY-ON ACTIVE — mode: $(cfg_mode) (auto-resumes this session when a usage limit resets; 'carry-on off' to disable)"
 else
   echo "carry-on installed — DISABLED ('carry-on on' to enable)"
+fi
+
+# Statusline setup, offered once on the first session where the badge is not
+# yet wired. This hook's stdout becomes session context, so the line below is
+# an instruction Claude acts on — the user still approves the actual edit.
+badge_dst="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/carry-on-statusline.sh"
+if [ ! -f "$badge_dst" ] && [ ! -f "$CARRY_ON_HOME/statusline_offered" ]; then
+  echo "The carry-on statusline badge is not set up. Offer the user ONCE to wire it: run /carry-on:statusline (copies $ROOT/hooks/statusline.sh to $badge_dst and chains it from the statusLine command in ~/.claude/settings.json). If they decline, drop it — this offer never repeats."
+  ensure_dirs
+  : > "$CARRY_ON_HOME/statusline_offered"
 fi
 
 # Reboot/crash recovery: a pending with no live sleeper gets one now.

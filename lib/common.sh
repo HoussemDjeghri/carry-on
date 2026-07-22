@@ -8,13 +8,15 @@ LOGS_DIR="$CARRY_ON_HOME/logs"
 CHAINS_DIR="$CARRY_ON_HOME/chains"
 LASTSEEN_DIR="$CARRY_ON_HOME/lastseen"
 DAILY_DIR="$CARRY_ON_HOME/daily"
+# shellcheck disable=SC2034  # consumed by the SessionStart reporter
+SESSIONS_DIR="$CARRY_ON_HOME/sessions"
 HISTORY_FILE="$CARRY_ON_HOME/history.jsonl"
 CONFIG_FILE="$CARRY_ON_HOME/config"
 # shellcheck disable=SC2034  # consumed by the scripts that source this file
 LOCK_DIR="$CARRY_ON_HOME/sleeper.lock"
 
 ensure_dirs() {
-  mkdir -p "$PENDING_DIR" "$LOGS_DIR" "$CHAINS_DIR" "$LASTSEEN_DIR" "$DAILY_DIR"
+  mkdir -p "$PENDING_DIR" "$LOGS_DIR" "$CHAINS_DIR" "$LASTSEEN_DIR" "$DAILY_DIR" "$SESSIONS_DIR"
 }
 
 pending_exists() {
@@ -98,7 +100,7 @@ cfg_daily_cap()     { config_get daily_cap 12; }
 # escalation the README discloses); skip degrades it to notify-only.
 cfg_resume_default_mode() { config_get resume_default_mode acceptEdits; }
 cfg_resume_prompt() {
-  config_get resume_prompt "The previous turn was cut off by a usage-limit reset, now lifted. Re-read your last message and continue exactly where you left off; do not restart completed work."
+  config_get resume_prompt "Resume work. Your previous turn was interrupted by a usage-limit reset, which has now lifted. Re-read your last message and the task you were on, then continue from the next incomplete step. Do not restart work already finished and do not wait for reconfirmation — carry on to completion."
 }
 
 now_epoch() { date +%s; }
@@ -119,6 +121,10 @@ notify() { # notify MESSAGE
   local msg="$1"
   if [ -n "${CARRY_ON_NOTIFY_LOG:-}" ]; then
     printf '%s\n' "$msg" >> "$CARRY_ON_NOTIFY_LOG"
+  elif command -v terminal-notifier >/dev/null 2>&1; then
+    # Preferred on macOS when installed: proper app attribution, no Script
+    # Editor "Show" button on every notification. argv-passed, no escaping.
+    terminal-notifier -title "carry-on" -message "$msg" >/dev/null 2>&1 || true
   elif command -v osascript >/dev/null 2>&1; then
     # Escape backslashes before quotes, or \" in the input would unescape.
     msg=${msg//\\/\\\\}; msg=${msg//\"/\\\"}

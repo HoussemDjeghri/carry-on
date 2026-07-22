@@ -354,6 +354,41 @@ check "reporter mentions prior resume for this cwd" bash -c "printf '%s' \"$out\
 out2=$(printf '{"session_id":"s-r","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh")
 check "reporter reports each resume once" bash -c "! printf '%s' \"$out2\" | grep -q 'was resumed'"
 
+# ───────────────────────── statusline badge ─────────────────────────
+echo "# statusline"
+fresh_env
+spayload() { printf '{"session_id":"%s","workspace":{"current_dir":"%s"}}' "$1" "$TESTDIR/proj"; }
+
+# No SessionStart marker yet → no badge, even though carry-on is enabled.
+out=$(spayload s-line | "$ROOT/hooks/statusline.sh")
+check "no badge without a session marker" test -z "$out"
+
+# SessionStart drops the marker → the badge appears for THAT session only.
+printf '{"session_id":"s-line","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh" >/dev/null
+out=$(spayload s-line | "$ROOT/hooks/statusline.sh")
+check "armed badge after marker" bash -c "printf '%s' \"$out\" | grep -q 'CARRY-ON'"
+check "armed badge is not the waiting variant" bash -c "! printf '%s' \"$out\" | grep -q 'waiting'"
+
+# A different session with no marker still gets nothing.
+out=$(spayload s-other | "$ROOT/hooks/statusline.sh")
+check "badge stays session-scoped" test -z "$out"
+
+# This session hits the limit (pending file for its id) → waiting variant.
+mkdir -p "$CARRY_ON_HOME/pending"; echo '{}' > "$CARRY_ON_HOME/pending/s-line.json"
+out=$(spayload s-line | "$ROOT/hooks/statusline.sh")
+check "waiting badge when this session is pending" bash -c "printf '%s' \"$out\" | grep -q 'waiting for reset'"
+rm -f "$CARRY_ON_HOME/pending/s-line.json"
+
+# Disabled globally → no badge regardless of marker.
+echo "enabled=false" > "$CARRY_ON_HOME/config"
+out=$(spayload s-line | "$ROOT/hooks/statusline.sh")
+check "no badge when disabled" test -z "$out"
+rm -f "$CARRY_ON_HOME/config"
+
+# A hostile session id can neither traverse paths nor reach the terminal.
+out=$(printf '{"session_id":"../../etc/passwd"}' | "$ROOT/hooks/statusline.sh")
+check "path-traversal session id yields no badge" test -z "$out"
+
 echo
 echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]
