@@ -143,10 +143,13 @@ automatic resume.
   notify-only instead. Headless `acceptEdits` still auto-approves only
   edits and basic file commands — arbitrary Bash still has no approver and
   doesn't run.
-- **Loop-proof, twice.** A resumed session that hits the limit again is
-  re-caught with a chain counter; after 3 resumes it goes notify-only. And
-  a global daily cap (default 12 resumes/day, `daily_cap`) bounds total
-  unattended spend across ALL sessions.
+- **Endures many resets, still loop-proof.** A long unattended run that hits
+  the limit again and again is carried on across *every* reset — the chain
+  counter only trips to notify-only on **rapid** re-deaths, a fresh window
+  burned through inside `chain_decay` (default 1h). That's the signature of a
+  resume loop; healthy usage spaced hours apart clears the counter and keeps
+  going. A global daily cap (default 12 resumes/day, `daily_cap`) still bounds
+  total unattended spend across ALL sessions.
 - **Deny list.** `carry-on config deny "$HOME/sensitive*:$HOME/other*"`
   keeps chosen projects out entirely.
 - All state is plain files under `~/.claude/carry-on/` — read them any time.
@@ -155,9 +158,11 @@ automatic resume.
 ## Config
 
 `carry-on config` shows current values. Keys: `enabled` · `mode`
-(resume|notify) · `resume_prompt` · `max_chain` (3) · `max_wait` (seconds,
-default 7 days) · `probe_model` (haiku) · `daily_cap` (12) ·
-`resume_default_mode` (acceptEdits|skip) · `deny` (colon-separated globs).
+(resume|notify) · `resume_prompt` · `max_chain` (3, rapid re-deaths before
+notify-only) · `chain_decay` (seconds, default 1h — gap that clears the
+chain) · `max_wait` (seconds, default 7 days) · `probe_model` (haiku) ·
+`daily_cap` (12) · `resume_default_mode` (acceptEdits|skip) · `deny`
+(colon-separated globs).
 
 ## Limits of scope
 

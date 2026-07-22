@@ -147,6 +147,9 @@ resume_one() { # resume_one PENDING_FILE
 
   ts=$(now_epoch)
   out="$LOGS_DIR/${id}-${ts}.log"
+  # Stamp the window handover before the run: the gap from here to any next
+  # limit death is how long the fresh window lasted — chain-decay reads it.
+  chain_mark_resume "$id"
   if (cd "$cwd" && "$CLAUDE" --resume "$id" -p "$prompt" --permission-mode "$pmode") > "$out" 2>&1; then
     resumed=$((resumed + 1)); history_append resumed "$id" "$cwd"
     chain_increment "$id"; daily_increment

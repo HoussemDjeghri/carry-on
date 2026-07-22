@@ -95,6 +95,11 @@ cfg_max_wait()      { config_get max_wait 604800; }   # 7 days
 cfg_deny()          { config_get deny ""; }
 cfg_probe_model()   { config_get probe_model haiku; }
 cfg_daily_cap()     { config_get daily_cap 12; }
+# Gap (seconds) after which a fresh limit hit is treated as healthy usage that
+# ran a full window rather than a runaway resume loop — it clears the chain.
+# Only rapid re-deaths (a fresh window burned through faster than this)
+# accumulate toward max_chain. Default 1h.
+cfg_chain_decay()   { config_get chain_decay 3600; }
 # How to resume a session that ran in default (prompt-per-edit) mode:
 # acceptEdits resumes it with edits auto-approved (useful, but an unattended
 # escalation the README discloses); skip degrades it to notify-only.
@@ -147,3 +152,10 @@ chain_increment() { # chain_increment SESSION_ID
   ensure_dirs
   echo $(( $(chain_count "$1") + 1 )) > "$CHAINS_DIR/$1"
 }
+
+# When a resume hands a session its fresh window, stamp the time. The gap
+# between this stamp and the next limit death is how long that window lasted —
+# the signal chain-decay uses to tell healthy usage from a resume loop.
+chain_last_resume() { cat "$CHAINS_DIR/$1.at" 2>/dev/null || echo 0; }
+chain_mark_resume() { ensure_dirs; now_epoch > "$CHAINS_DIR/$1.at"; }
+chain_reset()       { ensure_dirs; echo 0 > "$CHAINS_DIR/$1"; }

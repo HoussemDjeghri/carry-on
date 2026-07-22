@@ -138,6 +138,30 @@ reap
 check "chain cap -> pending kept as notify-only + exhausted recorded" \
   bash -c "jq -re '.notify_only == true' '$CARRY_ON_HOME/pending/s-chain.json' && grep -q '\"event\":\"exhausted\"' '$CARRY_ON_HOME/history.jsonl'"
 
+# Chain decay: a limit hit long after the last resume is healthy usage that
+# ran a full window, not a runaway loop — the chain clears and it resumes,
+# even though the raw count was already at the cap. This is what lets a long
+# AFK run survive many resets.
+fresh_env
+mkdir -p "$CARRY_ON_HOME/chains"
+echo 3 > "$CARRY_ON_HOME/chains/s-decay"
+echo $(( $(date +%s) - 7200 )) > "$CARRY_ON_HOME/chains/s-decay.at"   # resumed 2h ago > 1h decay
+payload s-decay "$TESTDIR/proj" acceptEdits | "$ROOT/hooks/stop-failure.sh"
+reap
+check "healthy gap clears the chain -> auto-resumes despite prior count" \
+  bash -c "jq -re '.notify_only == false' '$CARRY_ON_HOME/pending/s-decay.json'"
+
+# But a rapid re-death (fresh window burned through fast) is a real loop and
+# still trips the cap.
+fresh_env
+mkdir -p "$CARRY_ON_HOME/chains"
+echo 3 > "$CARRY_ON_HOME/chains/s-loop"
+echo $(( $(date +%s) - 30 )) > "$CARRY_ON_HOME/chains/s-loop.at"      # resumed 30s ago < 1h decay
+payload s-loop "$TESTDIR/proj" acceptEdits | "$ROOT/hooks/stop-failure.sh"
+reap
+check "rapid re-death still caps -> notify-only" \
+  bash -c "jq -re '.notify_only == true' '$CARRY_ON_HOME/pending/s-loop.json'"
+
 # ───────────────────────── sleeper full cycle ─────────────────────────
 echo "# sleeper"
 fresh_env
@@ -156,6 +180,7 @@ check "resume invoked with --resume s-cycle" grep -q -- "--resume s-cycle" "$SHI
 check "resume used recorded permission mode" grep -q -- "--permission-mode acceptEdits" "$SHIM_STATE/calls.log"
 check "pending cleared after resume" test ! -f "$CARRY_ON_HOME/pending/s-cycle.json"
 check "chain incremented" bash -c "test \"\$(cat '$CARRY_ON_HOME/chains/s-cycle')\" = 1"
+check "resume stamps window-handover time (chain decay signal)" test -f "$CARRY_ON_HOME/chains/s-cycle.at"
 check "resume log captured" bash -c "ls '$CARRY_ON_HOME/logs/' | grep -q s-cycle"
 check "history has resumed event" grep -q '"event":"resumed"' "$CARRY_ON_HOME/history.jsonl"
 check "summary notification sent" grep -q "resumed 1" "$CARRY_ON_NOTIFY_LOG"
