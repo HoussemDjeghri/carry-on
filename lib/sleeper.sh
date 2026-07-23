@@ -13,6 +13,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ensure_dirs
 mkdir "$LOCK_DIR" 2>/dev/null || true
 echo $$ > "$LOCK_DIR/pid"
+# Any "resuming" marker still here is stale from a crashed run — this fresh
+# sleeper is the only one that resumes, so clear them before it starts.
+rm -f "$RESUMING_DIR"/* 2>/dev/null || true
 
 SLICE="${CARRY_ON_SLICE:-60}"
 # Fallback wait steps (seconds) when no reset time is known: 15m, 30m, then hourly.
@@ -150,9 +153,15 @@ resume_one() { # resume_one PENDING_FILE
   # Stamp the window handover before the run: the gap from here to any next
   # limit death is how long the fresh window lasted — chain-decay reads it.
   chain_mark_resume "$id"
+  # Badge signal: this session is resuming RIGHT NOW. The still-open (limit-
+  # blocked) TUI shows "resuming…" live; cleared after the run either way.
+  : > "$RESUMING_DIR/$id"
   if (cd "$cwd" && "$CLAUDE" --resume "$id" -p "$prompt" --permission-mode "$pmode") > "$out" 2>&1; then
     resumed=$((resumed + 1)); history_append resumed "$id" "$cwd"
     chain_increment "$id"; daily_increment
+    # The continued transcript is now on disk. Flag the still-open TUI to
+    # reattach and see it; SessionStart clears this when the user reattaches.
+    : > "$RESUMED_DIR/$id"
     rm -f "$f"
   else
     # Transient failures (crash, network, a per-model bucket the probe's
@@ -167,6 +176,7 @@ resume_one() { # resume_one PENDING_FILE
       rm -f "$f"
     fi
   fi
+  rm -f "$RESUMING_DIR/$id"
 }
 
 while true; do

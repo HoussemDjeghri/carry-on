@@ -64,15 +64,31 @@ CARRY-ON ACTIVE — mode: resume (auto-resumes this session when a usage limit r
 ```
 
 That banner is a log line — it scrolls away. On first session carry-on
-offers to wire an **always-visible statusline badge**: `[● CARRY-ON]` in
-every session where auto-resume is armed, turning into
-`[● CARRY-ON — waiting for reset]` if that session hits the limit and is
-queued to wake. The badge is per-session — it shows only where carry-on is
-actually armed, nothing in other sessions. Accept the offer, or run
-`/carry-on:statusline` anytime. Setup copies the shipped badge script to
+offers to wire an **always-visible statusline badge** that tracks the
+session through the whole cycle:
+
+| Badge | Meaning |
+|---|---|
+| `[● CARRY-ON]` | armed and idle |
+| `[● CARRY-ON — waiting for reset]` | this session hit the limit, queued to wake |
+| `[● CARRY-ON — resuming…]` | a headless resume of this session is running now |
+| `[● CARRY-ON — resumed · reload]` | resumed — reattach to see the continued work |
+
+The badge is per-session — it shows only where carry-on is armed, nothing
+in other sessions. Because a headless resume writes to the session's
+transcript rather than into your open (limit-blocked) tab, the tab keeps
+showing stale state; the `resumed · reload` badge is your cue to reattach
+(`claude --resume <id>`), and on reattach carry-on confirms in one line that
+this session was carried on. Accept the offer, or run `/carry-on:statusline`
+anytime. Setup copies the shipped badge script to
 `~/.claude/hooks/carry-on-statusline.sh` and chains it from your
 `statusLine` command — created if you have none, appended if you already
 run your own script.
+
+The badge is the button-free signal by design: macOS has no way to post a
+NotificationCenter alert without either the Script Editor "Show" button
+(`osascript`) or an installed helper, so the always-visible badge — not the
+desktop notification — is carry-on's primary at-a-glance status.
 
 Optional on macOS: `brew install terminal-notifier` removes the "Show" button
 macOS attaches to the `osascript` fallback (that button opens Script Editor —

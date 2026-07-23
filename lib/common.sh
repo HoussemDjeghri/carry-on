@@ -10,13 +10,22 @@ LASTSEEN_DIR="$CARRY_ON_HOME/lastseen"
 DAILY_DIR="$CARRY_ON_HOME/daily"
 # shellcheck disable=SC2034  # consumed by the SessionStart reporter
 SESSIONS_DIR="$CARRY_ON_HOME/sessions"
+# Badge lifecycle markers (per session id), consumed by the statusline + reporter:
+#   resuming/<id> — a headless resume is running RIGHT NOW (set/cleared by the sleeper)
+#   resumed/<id>  — resumed successfully; the still-open TUI should reattach to
+#                   see the continued transcript (cleared by SessionStart on reattach)
+# shellcheck disable=SC2034
+RESUMING_DIR="$CARRY_ON_HOME/resuming"
+# shellcheck disable=SC2034
+RESUMED_DIR="$CARRY_ON_HOME/resumed"
 HISTORY_FILE="$CARRY_ON_HOME/history.jsonl"
 CONFIG_FILE="$CARRY_ON_HOME/config"
 # shellcheck disable=SC2034  # consumed by the scripts that source this file
 LOCK_DIR="$CARRY_ON_HOME/sleeper.lock"
 
 ensure_dirs() {
-  mkdir -p "$PENDING_DIR" "$LOGS_DIR" "$CHAINS_DIR" "$LASTSEEN_DIR" "$DAILY_DIR" "$SESSIONS_DIR"
+  mkdir -p "$PENDING_DIR" "$LOGS_DIR" "$CHAINS_DIR" "$LASTSEEN_DIR" "$DAILY_DIR" \
+    "$SESSIONS_DIR" "$RESUMING_DIR" "$RESUMED_DIR"
 }
 
 pending_exists() {

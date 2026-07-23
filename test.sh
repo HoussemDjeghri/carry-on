@@ -181,6 +181,8 @@ check "resume used recorded permission mode" grep -q -- "--permission-mode accep
 check "pending cleared after resume" test ! -f "$CARRY_ON_HOME/pending/s-cycle.json"
 check "chain incremented" bash -c "test \"\$(cat '$CARRY_ON_HOME/chains/s-cycle')\" = 1"
 check "resume stamps window-handover time (chain decay signal)" test -f "$CARRY_ON_HOME/chains/s-cycle.at"
+check "resume flags resumed-reload for the TUI" test -f "$CARRY_ON_HOME/resumed/s-cycle"
+check "resuming marker cleared after the run" test ! -f "$CARRY_ON_HOME/resuming/s-cycle"
 check "resume log captured" bash -c "ls '$CARRY_ON_HOME/logs/' | grep -q s-cycle"
 check "history has resumed event" grep -q '"event":"resumed"' "$CARRY_ON_HOME/history.jsonl"
 check "summary notification sent" grep -q "resumed 1" "$CARRY_ON_NOTIFY_LOG"
@@ -379,6 +381,16 @@ check "reporter mentions prior resume for this cwd" bash -c "printf '%s' \"$out\
 out2=$(printf '{"session_id":"s-r","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh")
 check "reporter reports each resume once" bash -c "! printf '%s' \"$out2\" | grep -q 'was resumed'"
 
+# Reattaching a session that was resumed headlessly: it says so once and clears
+# the "resumed · reload" flag (the user is now seeing the continued transcript).
+fresh_env
+mkdir -p "$CARRY_ON_HOME/resumed"; : > "$CARRY_ON_HOME/resumed/s-back"
+out=$(printf '{"session_id":"s-back","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh")
+check "reattach announces the headless resume" bash -c "printf '%s' \"$out\" | grep -q 'resumed headlessly'"
+check "reattach clears the resumed-reload flag" test ! -f "$CARRY_ON_HOME/resumed/s-back"
+out2=$(printf '{"session_id":"s-back","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh")
+check "resumed note shows once" bash -c "! printf '%s' \"$out2\" | grep -q 'resumed headlessly'"
+
 # ───────────────────────── statusline badge ─────────────────────────
 echo "# statusline"
 fresh_env
@@ -402,7 +414,20 @@ check "badge stays session-scoped" test -z "$out"
 mkdir -p "$CARRY_ON_HOME/pending"; echo '{}' > "$CARRY_ON_HOME/pending/s-line.json"
 out=$(spayload s-line | "$ROOT/hooks/statusline.sh")
 check "waiting badge when this session is pending" bash -c "printf '%s' \"$out\" | grep -q 'waiting for reset'"
+
+# A headless resume in flight → "resuming…", and it outranks the still-present
+# pending file (which is deleted only after the run).
+mkdir -p "$CARRY_ON_HOME/resuming"; : > "$CARRY_ON_HOME/resuming/s-line"
+out=$(spayload s-line | "$ROOT/hooks/statusline.sh")
+check "resuming badge while a headless resume runs (beats waiting)" bash -c "printf '%s' \"$out\" | grep -q 'resuming'"
+rm -f "$CARRY_ON_HOME/resuming/s-line"
 rm -f "$CARRY_ON_HOME/pending/s-line.json"
+
+# After a resume → "resumed · reload" cues the still-open TUI to reattach.
+mkdir -p "$CARRY_ON_HOME/resumed"; : > "$CARRY_ON_HOME/resumed/s-line"
+out=$(spayload s-line | "$ROOT/hooks/statusline.sh")
+check "resumed-reload badge after a headless resume" bash -c "printf '%s' \"$out\" | grep -q 'reload'"
+rm -f "$CARRY_ON_HOME/resumed/s-line"
 
 # Disabled globally → no badge regardless of marker.
 echo "enabled=false" > "$CARRY_ON_HOME/config"

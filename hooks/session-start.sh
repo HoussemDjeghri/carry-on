@@ -25,7 +25,16 @@ case "$session_id" in *[!A-Za-z0-9._-]*) session_id="" ;; esac
 if [ -n "$session_id" ] && [ "$(cfg_enabled)" = "true" ]; then
   ensure_dirs
   : > "$SESSIONS_DIR/$session_id"
-  find "$SESSIONS_DIR" -type f -mtime +30 -delete 2>/dev/null || true
+  find "$SESSIONS_DIR" "$RESUMED_DIR" "$RESUMING_DIR" -type f -mtime +30 -delete 2>/dev/null || true
+fi
+
+# If THIS session was resumed headlessly while it was down, this reattach is
+# the user seeing the continued transcript — say so and clear the badge's
+# "resumed · reload" flag. A headless resume of an interactive session lands
+# on disk, not in the open TUI, so reattaching is how the work becomes visible.
+if [ -n "$session_id" ] && [ -f "$RESUMED_DIR/$session_id" ]; then
+  echo "carry-on: this session was resumed headlessly after a usage-limit reset — you're now seeing the continued transcript ('carry-on log ${session_id%%-*}' for the run's output)."
+  rm -f "$RESUMED_DIR/$session_id"
 fi
 
 if [ "$(cfg_enabled)" = "true" ]; then
