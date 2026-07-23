@@ -74,9 +74,14 @@ actually armed, nothing in other sessions. Accept the offer, or run
 `statusLine` command — created if you have none, appended if you already
 run your own script.
 
-Optional on macOS: `brew install terminal-notifier` upgrades desktop
-notifications (proper app attribution instead of Script Editor's "Show"
-button).
+Optional on macOS: `brew install terminal-notifier` removes the "Show" button
+macOS attaches to the `osascript` fallback (that button opens Script Editor —
+nothing useful for a headless resume). carry-on can't route through Claude
+Code's own notifications: it posts from a detached process long after the
+session has exited, with no live session or terminal for Claude Code to notify
+through — so it posts to the OS directly, and terminal-notifier is simply the
+button-free poster. First terminal-notifier notification may need a one-time
+allow in System Settings → Notifications.
 
 ## How it works
 
