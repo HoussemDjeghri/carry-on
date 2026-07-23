@@ -126,12 +126,25 @@ notify() { # notify MESSAGE
   local msg="$1"
   if [ -n "${CARRY_ON_NOTIFY_LOG:-}" ]; then
     printf '%s\n' "$msg" >> "$CARRY_ON_NOTIFY_LOG"
-  elif command -v terminal-notifier >/dev/null 2>&1; then
-    # Preferred on macOS when installed: proper app attribution, no Script
-    # Editor "Show" button on every notification. argv-passed, no escaping.
-    terminal-notifier -title "carry-on" -message "$msg" >/dev/null 2>&1 || true
+    return
+  fi
+  # Prefer terminal-notifier on macOS: no Script Editor "Show" button, argv-
+  # passed (no escaping). Resolve via PATH, then Homebrew's standard prefixes —
+  # the detached sleeper can run with a stripped PATH that omits the brew bin.
+  local tn=""
+  if command -v terminal-notifier >/dev/null 2>&1; then
+    tn=terminal-notifier
+  elif [ -x /opt/homebrew/bin/terminal-notifier ]; then
+    tn=/opt/homebrew/bin/terminal-notifier
+  elif [ -x /usr/local/bin/terminal-notifier ]; then
+    tn=/usr/local/bin/terminal-notifier
+  fi
+  if [ -n "$tn" ]; then
+    "$tn" -title "carry-on" -message "$msg" >/dev/null 2>&1 || true
   elif command -v osascript >/dev/null 2>&1; then
-    # Escape backslashes before quotes, or \" in the input would unescape.
+    # Fallback: osascript's notification carries a Script Editor "Show" button
+    # that can't be removed from AppleScript — install terminal-notifier for a
+    # button-free poster. Escape backslashes before quotes, or \" unescapes.
     msg=${msg//\\/\\\\}; msg=${msg//\"/\\\"}
     osascript -e "display notification \"$msg\" with title \"carry-on\"" >/dev/null 2>&1 || true
   elif command -v notify-send >/dev/null 2>&1; then
