@@ -439,6 +439,12 @@ rm -f "$CARRY_ON_HOME/config"
 out=$(printf '{"session_id":"../../etc/passwd"}' | "$ROOT/hooks/statusline.sh")
 check "path-traversal session id yields no badge" test -z "$out"
 
+# ───────────────────────── notify: no desktop popup ─────────────────────────
+echo "# notify"
+fresh_env
+( unset CARRY_ON_NOTIFY_LOG; . "$ROOT/lib/common.sh"; notify "silent notice test" )
+check "notify records to notices.log, not a desktop popup" bash -c "grep -q 'silent notice test' '$CARRY_ON_HOME/notices.log'"
+
 echo
 echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]

@@ -33,7 +33,7 @@ fi
 # "resumed · reload" flag. A headless resume of an interactive session lands
 # on disk, not in the open TUI, so reattaching is how the work becomes visible.
 if [ -n "$session_id" ] && [ -f "$RESUMED_DIR/$session_id" ]; then
-  echo "carry-on: this session was resumed headlessly after a usage-limit reset — you're now seeing the continued transcript ('carry-on log ${session_id%%-*}' for the run's output)."
+  echo "carry-on: this session was resumed headlessly after a usage-limit reset — reload/reattach to see the live session. This reattached session IS the live one; any old tab still showing the limit error is stale. ('carry-on log ${session_id%%-*}' for the run's output.)"
   rm -f "$RESUMED_DIR/$session_id"
 fi
 

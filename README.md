@@ -85,19 +85,14 @@ anytime. Setup copies the shipped badge script to
 `statusLine` command — created if you have none, appended if you already
 run your own script.
 
-The badge is the button-free signal by design: macOS has no way to post a
-NotificationCenter alert without either the Script Editor "Show" button
-(`osascript`) or an installed helper, so the always-visible badge — not the
-desktop notification — is carry-on's primary at-a-glance status.
-
-Optional on macOS: `brew install terminal-notifier` removes the "Show" button
-macOS attaches to the `osascript` fallback (that button opens Script Editor —
-nothing useful for a headless resume). carry-on can't route through Claude
-Code's own notifications: it posts from a detached process long after the
-session has exited, with no live session or terminal for Claude Code to notify
-through — so it posts to the OS directly, and terminal-notifier is simply the
-button-free poster. First terminal-notifier notification may need a one-time
-allow in System Settings → Notifications.
+**No desktop notifications, by design.** carry-on never pops a desktop alert.
+The always-visible badge is the live signal, and reattaching a resumed session
+shows the continued work. (macOS can't post a NotificationCenter alert without
+the Script Editor "Show" button or an installed helper, and a detached resume
+has no terminal to notify through anyway — a badge you already trust beats a
+popup we'd have to caveat.) Every catch, wait, and resume is still recorded to
+`~/.claude/carry-on/notices.log` and the structured history behind
+`carry-on status`, so nothing is lost — it just doesn't interrupt you.
 
 ## How it works
 
@@ -115,10 +110,10 @@ allow in System Settings → Notifications.
 4. **Resume.** For each pending session:
    `claude --resume <id> -p "<continue prompt>"` from its original
    directory, with its original permission mode. Output is logged, history
-   recorded, desktop notification sent. The sleeper exits.
+   recorded, the badge flips to `resumed · reload`. The sleeper exits.
 
-Next time you open a session in that project, carry-on tells you what
-happened overnight:
+Next time you open a session in that project, or reattach the resumed one,
+carry-on tells you what happened overnight:
 
 ```
 carry-on: session f34907ab in this project was resumed after a limit reset — carry-on log f34907ab
@@ -132,21 +127,21 @@ carry-on: session f34907ab in this project was resumed after a limit reset — c
 | `/carry-on:cancel <id\|all>` | Drop pending wake(s) |
 | `/carry-on:on` / `/carry-on:off` | Enable / disable catching |
 | `/carry-on:statusline` | Wire the always-visible statusline badge |
-| `carry-on config mode notify` | Switch to notify-only (no auto-resume) |
+| `carry-on config mode notify` | Record-only: no auto-resume, signalled via the badge + `carry-on status` |
 | `carry-on log [id-prefix]` | Tail a resume's output log |
 
 ## Honest-cost note
 
 **Auto-resume spends your fresh usage window while you're away.** That is
-the point — but it should be a choice. Switch to notifications-only with one
-line:
+the point — but it should be a choice. Switch to record-only with one line:
 
 ```
 carry-on config mode notify
 ```
 
-You'll get "the window reset, session X is resumable" instead of an
-automatic resume.
+Then instead of an automatic resume, the window-reset is recorded to
+`carry-on status` and the badge holds `waiting for reset` until you resume
+that session yourself.
 
 ## Trust & safety
 

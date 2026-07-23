@@ -130,35 +130,19 @@ history_append() { # history_append EVENT SESSION_ID [EXTRA_JSON_OBJECT]
     '{ts: $ts, event: $ev, session_id: $id, cwd: $cwd}' >> "$HISTORY_FILE"
 }
 
-# Desktop notification, best effort; silent when no notifier exists.
+# carry-on posts NO desktop notifications by design: the statusline badge is
+# the live signal, and reattaching a resumed session shows the continued work.
+# This records each notice as a timestamped prose line beside the structured
+# history (`tail` it any time) and honors the test capture seam. It never
+# shells out to a desktop notifier.
 notify() { # notify MESSAGE
   local msg="$1"
   if [ -n "${CARRY_ON_NOTIFY_LOG:-}" ]; then
     printf '%s\n' "$msg" >> "$CARRY_ON_NOTIFY_LOG"
     return
   fi
-  # Prefer terminal-notifier on macOS: no Script Editor "Show" button, argv-
-  # passed (no escaping). Resolve via PATH, then Homebrew's standard prefixes —
-  # the detached sleeper can run with a stripped PATH that omits the brew bin.
-  local tn=""
-  if command -v terminal-notifier >/dev/null 2>&1; then
-    tn=terminal-notifier
-  elif [ -x /opt/homebrew/bin/terminal-notifier ]; then
-    tn=/opt/homebrew/bin/terminal-notifier
-  elif [ -x /usr/local/bin/terminal-notifier ]; then
-    tn=/usr/local/bin/terminal-notifier
-  fi
-  if [ -n "$tn" ]; then
-    "$tn" -title "carry-on" -message "$msg" >/dev/null 2>&1 || true
-  elif command -v osascript >/dev/null 2>&1; then
-    # Fallback: osascript's notification carries a Script Editor "Show" button
-    # that can't be removed from AppleScript — install terminal-notifier for a
-    # button-free poster. Escape backslashes before quotes, or \" unescapes.
-    msg=${msg//\\/\\\\}; msg=${msg//\"/\\\"}
-    osascript -e "display notification \"$msg\" with title \"carry-on\"" >/dev/null 2>&1 || true
-  elif command -v notify-send >/dev/null 2>&1; then
-    notify-send "carry-on" "$msg" >/dev/null 2>&1 || true
-  fi
+  ensure_dirs
+  printf '%s\t%s\n' "$(now_epoch)" "$msg" >> "$CARRY_ON_HOME/notices.log"
 }
 
 claude_bin() {
