@@ -23,6 +23,23 @@ CONFIG_FILE="$CARRY_ON_HOME/config"
 # shellcheck disable=SC2034  # consumed by the scripts that source this file
 LOCK_DIR="$CARRY_ON_HOME/sleeper.lock"
 
+# Claude Code config dir + the statusline wiring under it. The badge is a
+# "fragment" dropped into statusline.d/, which a dispatcher (the user's
+# statusLine command points at it) runs alongside every other fragment — a
+# drop-in dir so tools that each want a badge never fight over Claude Code's
+# single statusLine slot. These paths are read by the CLI and the SessionStart
+# hook, not by common.sh itself.
+# shellcheck disable=SC2034
+CLAUDE_CFG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+# shellcheck disable=SC2034
+STATUSLINE_D="$CLAUDE_CFG_DIR/statusline.d"
+# shellcheck disable=SC2034
+STATUSLINE_BADGE="$CLAUDE_CFG_DIR/hooks/carry-on-statusline.sh"
+STATUSLINE_FRAGMENT="$STATUSLINE_D/60-carry-on.sh"
+# shellcheck disable=SC2034
+STATUSLINE_DISPATCH="$CLAUDE_CFG_DIR/hooks/statusline-dispatch.sh"
+SETTINGS_FILE="$CLAUDE_CFG_DIR/settings.json"
+
 ensure_dirs() {
   mkdir -p "$PENDING_DIR" "$LOGS_DIR" "$CHAINS_DIR" "$LASTSEEN_DIR" "$DAILY_DIR" \
     "$SESSIONS_DIR" "$RESUMING_DIR" "$RESUMED_DIR"
@@ -165,3 +182,40 @@ chain_increment() { # chain_increment SESSION_ID
 chain_last_resume() { cat "$CHAINS_DIR/$1.at" 2>/dev/null || echo 0; }
 chain_mark_resume() { ensure_dirs; now_epoch > "$CHAINS_DIR/$1.at"; }
 chain_reset()       { ensure_dirs; echo 0 > "$CHAINS_DIR/$1"; }
+
+# Strip quotes and expand $HOME / $CLAUDE_CONFIG_DIR in a statusLine token, so a
+# path pulled from settings.json can be tested on disk. Best-effort: an exotic
+# expansion it does not know degrades to a non-existent path (→ "not wired"),
+# never to a wrong positive.
+_expand_config_path() { # _expand_config_path TOKEN
+  local t="$1"
+  t=${t//\"/}; t=${t//\'/}
+  t=${t//\$\{HOME\}/$HOME}; t=${t//\$HOME/$HOME}
+  t=${t//\$\{CLAUDE_CONFIG_DIR\}/$CLAUDE_CFG_DIR}; t=${t//\$CLAUDE_CONFIG_DIR/$CLAUDE_CFG_DIR}
+  printf '%s' "$t"
+}
+
+# Is carry-on's badge reachable from the ACTIVE statusLine command? True when
+# that command names our badge script, iterates the statusline.d drop-in dir
+# (with our fragment present), or names a script that — one level down — does
+# either. Keys off the CURRENT entry point only: a stale chain in a file
+# settings.json no longer points at reads correctly as un-wired. Heuristic but
+# safe — a command it cannot resolve degrades to "not wired", at worst one extra
+# re-offer line, never a wrong badge.
+statusline_wired() {
+  [ -f "$SETTINGS_FILE" ] || return 1
+  local cmd tok rt
+  cmd=$(jq -r '.statusLine.command // empty' "$SETTINGS_FILE" 2>/dev/null) || return 1
+  [ -n "$cmd" ] || return 1
+  case "$cmd" in
+    *carry-on-statusline.sh*) return 0 ;;
+    *statusline.d*) [ -f "$STATUSLINE_FRAGMENT" ] && return 0 ;;
+  esac
+  for tok in $cmd; do
+    rt=$(_expand_config_path "$tok")
+    [ -f "$rt" ] || continue
+    grep -qs 'carry-on-statusline\.sh' "$rt" && return 0
+    grep -qs 'statusline\.d' "$rt" && [ -f "$STATUSLINE_FRAGMENT" ] && return 0
+  done
+  return 1
+}

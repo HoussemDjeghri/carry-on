@@ -43,14 +43,27 @@ else
   echo "carry-on installed — DISABLED ('carry-on on' to enable)"
 fi
 
-# Statusline setup, offered once on the first session where the badge is not
-# yet wired. This hook's stdout becomes session context, so the line below is
-# an instruction Claude acts on — the user still approves the actual edit.
-badge_dst="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/carry-on-statusline.sh"
-if [ ! -f "$badge_dst" ] && [ ! -f "$CARRY_ON_HOME/statusline_offered" ]; then
-  echo "The carry-on statusline badge is not set up. Offer the user ONCE to wire it: run /carry-on:statusline (copies $ROOT/hooks/statusline.sh to $badge_dst and chains it from the statusLine command in ~/.claude/settings.json). If they decline, drop it — this offer never repeats."
-  ensure_dirs
-  : > "$CARRY_ON_HOME/statusline_offered"
+# Statusline badge wiring. This hook's stdout becomes session context, so the
+# lines below are instructions Claude acts on — the user still approves any edit.
+# Two jobs:
+#   1. Offer to wire the badge once, on the first session where it is not set up.
+#   2. Self-heal: if a previously-wired badge is no longer reachable from the
+#      active statusLine — the one collision the drop-in dir cannot prevent, a
+#      foreign statusline setup repointing settings.json — re-offer to re-wire.
+# The statusline_wired flag makes the re-offer fire once per wired→unwired
+# transition, never as a nag. Only while enabled — a disabled plugin shows no
+# badge by design.
+if [ "$(cfg_enabled)" = "true" ]; then
+  if statusline_wired; then
+    ensure_dirs; : > "$CARRY_ON_HOME/statusline_wired"
+  elif [ -f "$CARRY_ON_HOME/statusline_wired" ]; then
+    rm -f "$CARRY_ON_HOME/statusline_wired"
+    echo "carry-on: the statusline badge is no longer wired into your active statusline — another statusline setup replaced it. Re-wire it (collision-proof, via the drop-in dir) by running /carry-on:statusline."
+  elif [ ! -f "$STATUSLINE_BADGE" ] && [ ! -f "$CARRY_ON_HOME/statusline_offered" ]; then
+    echo "The carry-on statusline badge is not set up. Offer the user ONCE to wire it: run /carry-on:statusline (it drops a fragment into $STATUSLINE_D and never overwrites another tool's statusline). If they decline, drop it — this offer never repeats."
+    ensure_dirs
+    : > "$CARRY_ON_HOME/statusline_offered"
+  fi
 fi
 
 # Reboot/crash recovery: a pending with no live sleeper gets one now.

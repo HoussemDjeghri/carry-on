@@ -122,6 +122,68 @@ cmd_config() {
   echo "$key=$value"
 }
 
+# Set settings.json .statusLine to a command, preserving other keys. Backs up
+# first and validates the result before replacing — a broken edit never lands.
+_set_statusline_command() { # _set_statusline_command COMMAND
+  local cmd="$1" tmp="$SETTINGS_FILE.tmp.$$"
+  mkdir -p "$(dirname "$SETTINGS_FILE")"
+  if [ -f "$SETTINGS_FILE" ]; then
+    cp "$SETTINGS_FILE" "$SETTINGS_FILE.carry-on.bak"
+    jq --arg c "$cmd" '.statusLine = {type:"command", command:$c}' "$SETTINGS_FILE" > "$tmp" 2>/dev/null \
+      || { rm -f "$tmp"; return 1; }
+  else
+    jq -n --arg c "$cmd" '{statusLine:{type:"command", command:$c}}' > "$tmp" 2>/dev/null \
+      || { rm -f "$tmp"; return 1; }
+  fi
+  jq -e . "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$SETTINGS_FILE"
+}
+
+# Wire the statusline badge as a drop-in fragment — never overwriting another
+# tool's statusline. The badge is a stable copy (survives plugin updates) run by
+# a fragment in statusline.d/. Exit 3 + a NEEDS-CHOICE line means the user
+# already runs their own statusline and the caller must decide how to join it.
+cmd_statusline() {
+  ensure_dirs
+  mkdir -p "$STATUSLINE_D" "$(dirname "$STATUSLINE_BADGE")"
+  if ! cp "$ROOT/hooks/statusline.sh" "$STATUSLINE_BADGE" || ! chmod +x "$STATUSLINE_BADGE"; then
+    die "could not install the badge script to $STATUSLINE_BADGE"
+  fi
+  cat > "$STATUSLINE_FRAGMENT" <<EOF
+#!/bin/bash
+# statusline.d fragment — carry-on auto-resume badge. Needs the Claude Code
+# statusline JSON on stdin. Drop-in: delete this file to remove the badge.
+exec bash "$STATUSLINE_BADGE"
+EOF
+
+  # Already reachable (an existing dispatcher picks up the fragment, or a prior
+  # chain names the badge) → nothing to wire.
+  if statusline_wired; then
+    : > "$CARRY_ON_HOME/statusline_wired"
+    echo "carry-on: badge wired — your statusline runs the drop-in fragment."
+    return 0
+  fi
+
+  local cmd
+  cmd=$(jq -r '.statusLine.command // empty' "$SETTINGS_FILE" 2>/dev/null || true)
+  if [ -z "$cmd" ]; then
+    # No statusline yet: install the generic dispatcher and point at it. Nothing
+    # to clobber, and a dispatcher lets the next tool drop a fragment too.
+    if ! cp "$ROOT/hooks/statusline-dispatch.sh" "$STATUSLINE_DISPATCH" || ! chmod +x "$STATUSLINE_DISPATCH"; then
+      die "could not install the dispatcher to $STATUSLINE_DISPATCH"
+    fi
+    _set_statusline_command "bash \"$STATUSLINE_DISPATCH\"" || die "could not update $SETTINGS_FILE"
+    : > "$CARRY_ON_HOME/statusline_wired"
+    echo "carry-on: installed a drop-in statusline showing the badge. Other tools can add badges by dropping a file in $STATUSLINE_D."
+    return 0
+  fi
+
+  # A statusline exists and does not reach us — never overwrite it. Hand the
+  # decision (join it vs. convert to the drop-in dispatcher) back to the caller.
+  printf 'NEEDS-CHOICE\t%s\n' "$cmd"
+  return 3
+}
+
 case "${1:-help}" in
   status)  cmd_status ;;
   cancel)  shift; cmd_cancel "$@" ;;
@@ -129,6 +191,7 @@ case "${1:-help}" in
   off)     config_set enabled false; echo "carry-on disabled (pending wakes kept; carry-on cancel all to drop them)" ;;
   log)     shift; cmd_log "$@" ;;
   config)  shift; cmd_config "$@" ;;
+  statusline) cmd_statusline ;;
   help|--help|-h)
     cat <<'EOF'
 carry-on — auto-resume Claude Code sessions after usage-limit resets
@@ -137,6 +200,7 @@ carry-on — auto-resume Claude Code sessions after usage-limit resets
   carry-on on|off              enable / disable catching
   carry-on config [key value]  show or set config (mode=resume|notify, ...)
   carry-on log [id-prefix]     tail a resume log
+  carry-on statusline          wire the always-visible badge (drop-in, safe)
 EOF
     ;;
   *) die "unknown command '$1' (try: carry-on help)" ;;

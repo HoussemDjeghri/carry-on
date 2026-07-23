@@ -2,23 +2,38 @@
 description: Wire the always-visible carry-on statusline badge
 ---
 
-Set up the carry-on statusline badge (`[CARRY-ON]`, becoming `[CARRY-ON ●N]`
-while N sessions wait to wake). Steps:
+Wire the carry-on statusline badge. Run:
 
-1. Copy `"${CLAUDE_PLUGIN_ROOT}/hooks/statusline.sh"` to
-   `~/.claude/hooks/carry-on-statusline.sh` (create the directory if needed,
-   keep it executable). The stable copy survives plugin updates.
-2. Read `~/.claude/settings.json` and look at `statusLine`:
-   - **Not set:** set it to
-     `{"type": "command", "command": "bash \"$HOME/.claude/hooks/carry-on-statusline.sh\""}`.
-   - **Points at a script file:** append to that script, before its final
-     newline print:
+`"${CLAUDE_PLUGIN_ROOT}/bin/carry-on" statusline`
+
+It installs the badge as a **drop-in fragment** (`~/.claude/statusline.d/60-carry-on.sh`)
+and wires it without ever overwriting another tool's statusline. Then:
+
+- **Exit 0** — done. Relay its confirmation line to the user; the badge appears
+  on the next statusline refresh.
+- **Output starts with `NEEDS-CHOICE`** (followed by a tab and the user's current
+  statusline command) — the user already runs their own statusline that does not
+  include the badge, and carry-on will not overwrite it. Show them that command
+  and offer two ways to add the badge:
+
+  1. **Convert to the drop-in dispatcher (recommended — collision-proof).** So no
+     future statusline setup can strand any badge:
+     - Copy `${CLAUDE_PLUGIN_ROOT}/hooks/statusline-dispatch.sh` to
+       `~/.claude/hooks/statusline-dispatch.sh`.
+     - Move their current behavior into a fragment `~/.claude/statusline.d/10-mine.sh`
+       — a small script that runs their old command with the statusline JSON on
+       stdin (their badge keeps its place; the `10-` prefix renders it first).
+     - Point `settings.json` `.statusLine.command` at
+       `bash "$HOME/.claude/hooks/statusline-dispatch.sh"`.
+
+  2. **Chain (quick, less robust).** If their command runs a script file, append
+     to that script, before its final print:
 
      ```bash
-     carry_on_badge=$(bash "$HOME/.claude/hooks/carry-on-statusline.sh" 2>/dev/null)
-     [ -n "$carry_on_badge" ] && printf ' %s' "$carry_on_badge"
+     carry_on=$(bash "$HOME/.claude/hooks/carry-on-statusline.sh" <<<"$input" 2>/dev/null)
+     [ -n "$carry_on" ] && printf ' %s' "$carry_on"
      ```
-   - **Some other inline command:** show the user the snippet above and ask
-     where to put it; never overwrite a statusline you don't understand.
-3. Validate `jq . ~/.claude/settings.json` still parses, then tell the user
-   the badge appears on the next statusline refresh.
+
+  Never overwrite a statusline command you don't understand — ask first.
+
+After wiring, confirm `jq . ~/.claude/settings.json` still parses.

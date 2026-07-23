@@ -7,7 +7,7 @@
 
 <p>
   <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-D97757">
-  <img alt="version 0.1.1" src="https://img.shields.io/badge/version-0.1.1-191919">
+  <img alt="version 0.1.2" src="https://img.shields.io/badge/version-0.1.2-191919">
   <img alt="dependencies: bash and jq" src="https://img.shields.io/badge/deps-bash%20%2B%20jq-D4A27F">
   <img alt="no daemon" src="https://img.shields.io/badge/no-daemon-555">
 </p>
@@ -79,11 +79,25 @@ in other sessions. Because a headless resume writes to the session's
 transcript rather than into your open (limit-blocked) tab, the tab keeps
 showing stale state; the `resumed · reload` badge is your cue to reattach
 (`claude --resume <id>`), and on reattach carry-on confirms in one line that
-this session was carried on. Accept the offer, or run `/carry-on:statusline`
-anytime. Setup copies the shipped badge script to
-`~/.claude/hooks/carry-on-statusline.sh` and chains it from your
-`statusLine` command — created if you have none, appended if you already
-run your own script.
+this session was carried on.
+
+**It plays nice with other statusline tools.** Accept the offer, or run
+`/carry-on:statusline` anytime. Claude Code exposes a *single* `statusLine`
+command, so badges from different tools otherwise fight over it — every new
+setup appends to or overwrites the last, and one eventually wins. carry-on
+wires itself as a **drop-in fragment** instead: it installs a small badge
+script and drops `~/.claude/statusline.d/60-carry-on.sh`, run by a dispatcher
+your `statusLine` points at. Every tool that adopts the pattern owns one file
+— add a badge by dropping a file, remove it by deleting the file, nothing
+edits what it doesn't own. No statusline yet? carry-on installs the dispatcher.
+Already run one? It **never overwrites it** — it adds the fragment when your
+statusline is a dispatcher, or asks how to join when it isn't.
+
+The one collision a drop-in dir can't prevent is another tool *replacing* your
+`statusLine` command wholesale — that drops every badge at once, not just
+carry-on's. So carry-on **self-heals**: each session it checks whether its
+badge is still wired, and if something un-wired it, says so once and offers to
+re-wire. A silent break becomes a one-session recovery.
 
 **No desktop notifications, by design.** carry-on never pops a desktop alert.
 The always-visible badge is the live signal, and reattaching a resumed session

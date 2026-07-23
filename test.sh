@@ -41,7 +41,10 @@ fresh_env() {
   export CARRY_ON_SLICE=1
   export CARRY_ON_FALLBACK_STEPS="2 2 2"
   export CLAUDE_BIN="$TESTDIR/bin/claude"
-  mkdir -p "$TESTDIR/bin" "$TESTDIR/proj"
+  # Isolate statusline wiring from the real ~/.claude — settings.json edits and
+  # the drop-in dir must never touch the developer's machine during a test run.
+  export CLAUDE_CONFIG_DIR="$TESTDIR/cfg"
+  mkdir -p "$TESTDIR/bin" "$TESTDIR/proj" "$TESTDIR/cfg/hooks"
   export SHIM_STATE="$TESTDIR/shim"
   mkdir -p "$SHIM_STATE"
   # Shim: limited until $SHIM_STATE/reset-done exists; records every argv.
@@ -438,6 +441,113 @@ rm -f "$CARRY_ON_HOME/config"
 # A hostile session id can neither traverse paths nor reach the terminal.
 out=$(printf '{"session_id":"../../etc/passwd"}' | "$ROOT/hooks/statusline.sh")
 check "path-traversal session id yields no badge" test -z "$out"
+
+# ───────────── statusline: drop-in dispatcher, wiring, self-heal ─────────────
+echo "# statusline drop-in"
+wired()    { bash -c ". \"$ROOT/lib/common.sh\"; statusline_wired"; }
+notwired() { if bash -c ". \"$ROOT/lib/common.sh\"; statusline_wired"; then return 1; else return 0; fi; }
+set_dispatcher_statusline() { # active statusLine = a dispatcher reading statusline.d
+  cp "$ROOT/hooks/statusline-dispatch.sh" "$CLAUDE_CONFIG_DIR/hooks/statusline-dispatch.sh"
+  jq -n --arg c "bash \"$CLAUDE_CONFIG_DIR/hooks/statusline-dispatch.sh\"" \
+    '{statusLine:{type:"command",command:$c}}' > "$CLAUDE_CONFIG_DIR/settings.json"
+}
+
+# The shipped dispatcher runs fragments in filename order, joins with a space,
+# and skips one that errors or prints nothing.
+fresh_env
+mkdir -p "$CLAUDE_CONFIG_DIR/statusline.d"
+printf '#!/bin/bash\necho AAA\n' > "$CLAUDE_CONFIG_DIR/statusline.d/20-a.sh"
+printf '#!/bin/bash\nexit 1\n'   > "$CLAUDE_CONFIG_DIR/statusline.d/40-broken.sh"
+printf '#!/bin/bash\necho ZZZ\n' > "$CLAUDE_CONFIG_DIR/statusline.d/60-z.sh"
+out=$(printf '{"session_id":"x"}' | bash "$ROOT/hooks/statusline-dispatch.sh")
+check "dispatcher joins fragments in order, skips broken/empty" test "$out" = "AAA ZZZ"
+
+# statusline_wired reflects only the ACTIVE statusLine command.
+fresh_env
+mkdir -p "$CLAUDE_CONFIG_DIR/statusline.d"
+: > "$CLAUDE_CONFIG_DIR/statusline.d/60-carry-on.sh"
+set_dispatcher_statusline
+check "wired: active dispatcher routes the drop-in dir + fragment present" wired
+rm -f "$CLAUDE_CONFIG_DIR/statusline.d/60-carry-on.sh"
+check "not wired: dispatcher active but our fragment missing" notwired
+
+fresh_env
+jq -n '{statusLine:{type:"command",command:"echo hello"}}' > "$CLAUDE_CONFIG_DIR/settings.json"
+check "not wired: foreign statusline never mentions the badge" notwired
+
+fresh_env
+printf '#!/bin/bash\ninput=$(cat)\nbash "$HOME/.claude/hooks/carry-on-statusline.sh" <<<"$input"\n' \
+  > "$CLAUDE_CONFIG_DIR/hooks/mine.sh"
+jq -n --arg c "bash \"$CLAUDE_CONFIG_DIR/hooks/mine.sh\"" \
+  '{statusLine:{type:"command",command:$c}}' > "$CLAUDE_CONFIG_DIR/settings.json"
+check "wired: a composer script that chains the badge" wired
+
+fresh_env
+rm -f "$CLAUDE_CONFIG_DIR/settings.json"
+check "not wired: no settings.json" notwired
+
+echo "# statusline wiring (carry-on statusline)"
+# No statusline yet → install the dispatcher, point settings at it, drop the
+# fragment, report wired.
+fresh_env
+rm -f "$CLAUDE_CONFIG_DIR/settings.json"
+out=$("$ROOT/bin/carry-on" statusline); rc=$?
+check "no statusline → exits 0" test "$rc" = 0
+check "no statusline → dispatcher installed" test -f "$CLAUDE_CONFIG_DIR/hooks/statusline-dispatch.sh"
+check "no statusline → fragment dropped" test -f "$CLAUDE_CONFIG_DIR/statusline.d/60-carry-on.sh"
+check "no statusline → stable badge copy installed" test -f "$CLAUDE_CONFIG_DIR/hooks/carry-on-statusline.sh"
+check "no statusline → settings point at the dispatcher" \
+  bash -c "jq -re '.statusLine.command | contains(\"statusline-dispatch\")' '$CLAUDE_CONFIG_DIR/settings.json'"
+check "no statusline → now wired" wired
+
+# Existing foreign dispatcher already reading statusline.d → drop the fragment,
+# never touch settings.
+fresh_env
+set_dispatcher_statusline
+before=$(cat "$CLAUDE_CONFIG_DIR/settings.json")
+out=$("$ROOT/bin/carry-on" statusline); rc=$?
+check "existing dispatcher → exits 0, fragment present" \
+  bash -c "test '$rc' = 0 && test -f '$CLAUDE_CONFIG_DIR/statusline.d/60-carry-on.sh'"
+check "existing dispatcher → settings left untouched (no clobber)" \
+  test "$(cat "$CLAUDE_CONFIG_DIR/settings.json")" = "$before"
+
+# Foreign non-dispatcher statusline → never overwrite; signal a choice.
+fresh_env
+jq -n '{statusLine:{type:"command",command:"echo hi"}}' > "$CLAUDE_CONFIG_DIR/settings.json"
+before=$(cat "$CLAUDE_CONFIG_DIR/settings.json")
+out=$("$ROOT/bin/carry-on" statusline); rc=$?
+check "foreign statusline → exit 3" test "$rc" = 3
+check "foreign statusline → NEEDS-CHOICE emitted" bash -c "printf '%s' \"$out\" | grep -q NEEDS-CHOICE"
+check "foreign statusline → not overwritten" \
+  test "$(cat "$CLAUDE_CONFIG_DIR/settings.json")" = "$before"
+
+echo "# reporter: statusline self-heal"
+# Wired now → SessionStart records the flag, stays quiet.
+fresh_env
+mkdir -p "$CLAUDE_CONFIG_DIR/statusline.d"
+: > "$CLAUDE_CONFIG_DIR/statusline.d/60-carry-on.sh"
+: > "$CLAUDE_CONFIG_DIR/hooks/carry-on-statusline.sh"
+set_dispatcher_statusline
+out=$(printf '{"session_id":"s-heal","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh")
+check "wired → wired flag set" test -f "$CARRY_ON_HOME/statusline_wired"
+check "wired → no re-offer" bash -c "! printf '%s' \"$out\" | grep -q 'no longer wired'"
+
+# A foreign setup replaces the statusline → next session re-offers ONCE.
+jq -n '{statusLine:{type:"command",command:"echo hi"}}' > "$CLAUDE_CONFIG_DIR/settings.json"
+out=$(printf '{"session_id":"s-heal","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh")
+check "un-wired after being wired → re-offer emitted" bash -c "printf '%s' \"$out\" | grep -q 'no longer wired'"
+check "re-offer clears the wired flag" test ! -f "$CARRY_ON_HOME/statusline_wired"
+out2=$(printf '{"session_id":"s-heal","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh")
+check "re-offer fires once, not every session (no nag)" \
+  bash -c "! printf '%s' \"$out2\" | grep -qE 'no longer wired|not set up'"
+
+# First-time offer: never wired, badge not installed → offer once.
+fresh_env
+rm -f "$CLAUDE_CONFIG_DIR/settings.json"
+out=$(printf '{"session_id":"s-first","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh")
+check "first session → badge setup offered" bash -c "printf '%s' \"$out\" | grep -q 'not set up'"
+out2=$(printf '{"session_id":"s-first","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh")
+check "setup offer never repeats" bash -c "! printf '%s' \"$out2\" | grep -q 'not set up'"
 
 # ───────────────────────── notify: no desktop popup ─────────────────────────
 echo "# notify"

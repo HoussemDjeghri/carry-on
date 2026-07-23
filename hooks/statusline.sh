@@ -9,16 +9,12 @@
 # the SessionStart hook drops a per-session marker; no marker means no badge
 # (plugin off, or a session from another setup).
 #
-# Usage in ~/.claude/settings.json:
+# Wiring: `/carry-on:statusline` drops this as a fragment in ~/.claude/statusline.d/
+# (run by a dispatcher your statusLine points at) so it coexists with other
+# tools' badges instead of fighting over Claude Code's single statusLine slot.
+# It reads the statusline JSON on stdin for the session id. Standalone use:
 #   "statusLine": { "type": "command", "command": "bash /path/to/carry-on-statusline.sh" }
-# or chain from an existing statusline script — forward its stdin, the badge
-# needs the session id Claude Code pipes in:
-#   carry_on_badge=$(printf '%s' "$input" | bash "$HOME/.claude/hooks/carry-on-statusline.sh" 2>/dev/null)
-#   [ -n "$carry_on_badge" ] && printf ' %s' "$carry_on_badge"
-#
-# Plugin users: Claude offers to set this up on first session (it copies this
-# file to ~/.claude/hooks/carry-on-statusline.sh so the badge survives plugin
-# updates); /carry-on:statusline does the same on demand.
+# The stable copy at ~/.claude/hooks/carry-on-statusline.sh survives plugin updates.
 #
 # Runs on every statusline refresh: no jq, no sourcing. Renders only fixed
 # strings — never state-file or stdin content — and the session id is
