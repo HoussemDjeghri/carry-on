@@ -13,7 +13,7 @@ wait-then-resume semantics (bypass-sounding names rejected).
 
 ## Why it exists
 
-Overnight/AFK agent work dies at the 5-hour or weekly limit and stays dead
+Overnight/unattended agent work dies at the 5-hour or weekly limit and stays dead
 until a human returns. Prior art solves it pre-hook-era: resident daemons,
 probe-polling loops, tmux pane-text watching, keystroke injection with
 ownership leases (unsnooze), transcript-mtime heuristics (Windows
@@ -41,7 +41,7 @@ smallest sunk cost in the space.
 
 ## Architecture
 
-Repo root = plugin (marketplace pattern shared with bridger):
+Repo root = plugin (standard Claude Code plugin + marketplace layout):
 
 - `.claude-plugin/plugin.json` — registers hooks: `StopFailure` (matcher
   `rate_limit`) → catcher; `SessionStart` → reporter.

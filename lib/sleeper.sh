@@ -121,7 +121,12 @@ resume_one() { # resume_one PENDING_FILE
   #   default-mode sessions resume per resume_default_mode — acceptEdits
   #   (useful, disclosed escalation) or skip (notify instead).
   case "$pmode" in
-    bypassPermissions) pmode="acceptEdits" ;;
+    bypassPermissions)
+      # Replayed as-is by default — continuity of the posture the session was
+      # already running. Set resume_bypass_mode=acceptEdits to downgrade to a
+      # safer unattended run (which then can't run git/tests/CLI either).
+      if [ "$(cfg_resume_bypass_mode)" = "acceptEdits" ]; then pmode="acceptEdits"; fi
+      ;;
     default)
       if [ "$(cfg_resume_default_mode)" = "skip" ]; then
         history_append reset_notified "$id" "$cwd"

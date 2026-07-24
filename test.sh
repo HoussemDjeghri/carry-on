@@ -144,7 +144,7 @@ check "chain cap -> pending kept as notify-only + exhausted recorded" \
 # Chain decay: a limit hit long after the last resume is healthy usage that
 # ran a full window, not a runaway loop — the chain clears and it resumes,
 # even though the raw count was already at the cap. This is what lets a long
-# AFK run survive many resets.
+# unattended run survive many resets.
 fresh_env
 mkdir -p "$CARRY_ON_HOME/chains"
 echo 3 > "$CARRY_ON_HOME/chains/s-decay"
@@ -190,7 +190,7 @@ check "resume log captured" bash -c "ls '$CARRY_ON_HOME/logs/' | grep -q s-cycle
 check "history has resumed event" grep -q '"event":"resumed"' "$CARRY_ON_HOME/history.jsonl"
 check "summary notification sent" grep -q "resumed 1" "$CARRY_ON_NOTIFY_LOG"
 
-echo "# sleeper: bypassPermissions downgrade"
+echo "# sleeper: bypassPermissions inherited by default (continuity)"
 fresh_env
 touch "$SHIM_STATE/reset-done"
 mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains"
@@ -198,7 +198,19 @@ jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
   '{session_id:"s-bypass", cwd:$cwd, permission_mode:"bypassPermissions", reset_epoch:($t-1), chain:0, caught_at:$t}' \
   > "$CARRY_ON_HOME/pending/s-bypass.json"
 "$ROOT/lib/sleeper.sh"
-check "bypassPermissions never replayed (downgraded)" bash -c "grep -- '--resume s-bypass' '$SHIM_STATE/calls.log' | grep -q -- '--permission-mode acceptEdits'"
+check "bypassPermissions replayed by default (inherits the original)" bash -c "grep -- '--resume s-bypass' '$SHIM_STATE/calls.log' | grep -q -- '--permission-mode bypassPermissions'"
+
+echo "# sleeper: bypassPermissions downgrade (opt-out)"
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains"
+echo "resume_bypass_mode=acceptEdits" > "$CARRY_ON_HOME/config"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-bypass2", cwd:$cwd, permission_mode:"bypassPermissions", reset_epoch:($t-1), chain:0, caught_at:$t}' \
+  > "$CARRY_ON_HOME/pending/s-bypass2.json"
+"$ROOT/lib/sleeper.sh"
+check "resume_bypass_mode=acceptEdits downgrades to acceptEdits" \
+  bash -c "grep -- '--resume s-bypass2' '$SHIM_STATE/calls.log' | grep -q -- '--permission-mode acceptEdits'"
 
 echo "# sleeper: notify-only mode"
 fresh_env

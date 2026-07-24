@@ -44,7 +44,7 @@ ensure_dirs
 
 # Chain decay: a limit hit long after the last resume means the fresh window
 # ran its full healthy course, not a runaway resume loop — clear the chain so
-# long AFK runs keep being carried on across many resets. Only rapid
+# long unattended runs keep being carried on across many resets. Only rapid
 # re-deaths (a fresh window burned through inside chain_decay) accumulate.
 last_resume=$(chain_last_resume "$session_id")
 if [ "$last_resume" -gt 0 ] && [ $(( $(now_epoch) - last_resume )) -ge "$(cfg_chain_decay)" ]; then

@@ -97,6 +97,7 @@ _default_for() { # bash-3.2-safe defaults lookup (no case inside $())
     daily_cap) echo 12 ;;
     chain_decay) echo 3600 ;;
     resume_default_mode) echo acceptEdits ;;
+    resume_bypass_mode) echo bypass ;;
     *) echo "" ;;
   esac
 }
@@ -106,7 +107,7 @@ cmd_config() {
   if [ -z "$key" ]; then
     banner
     local k
-    for k in mode max_chain chain_decay max_wait probe_model daily_cap resume_default_mode deny; do
+    for k in mode max_chain chain_decay max_wait probe_model daily_cap resume_default_mode resume_bypass_mode deny; do
       echo "$k=$(config_get "$k" "$(_default_for "$k")")"
     done
     return
@@ -115,8 +116,9 @@ cmd_config() {
   case "$key" in
     mode) case "$value" in resume|notify) ;; *) die "mode is resume|notify" ;; esac ;;
     resume_default_mode) case "$value" in acceptEdits|skip) ;; *) die "resume_default_mode is acceptEdits|skip" ;; esac ;;
+    resume_bypass_mode) case "$value" in acceptEdits|bypass) ;; *) die "resume_bypass_mode is acceptEdits|bypass" ;; esac ;;
     enabled|max_chain|chain_decay|max_wait|probe_model|daily_cap|deny|resume_prompt) ;;
-    *) die "unknown key '$key' (enabled mode resume_prompt max_chain chain_decay max_wait probe_model daily_cap resume_default_mode deny)" ;;
+    *) die "unknown key '$key' (enabled mode resume_prompt max_chain chain_decay max_wait probe_model daily_cap resume_default_mode resume_bypass_mode deny)" ;;
   esac
   config_set "$key" "$value"
   echo "$key=$value"

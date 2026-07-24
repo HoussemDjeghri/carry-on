@@ -163,16 +163,23 @@ that session yourself.
   death and its resume, then exits. Uninstall leaves nothing running.
 - **Never types into terminals.** Resumes are headless `claude --resume`
   child processes; your panes are never touched.
-- **Permission posture, stated precisely.** A `bypassPermissions` session is
-  resumed at `acceptEdits`, never bypass. Plan-mode sessions are never
-  auto-resumed — that's a human mid-decision. A **default-mode** session
-  (prompts before each edit) is resumed at `acceptEdits` so the resume can
-  actually work unattended — that IS a step up from what you were running,
-  disclosed here on purpose; set
-  `carry-on config resume_default_mode skip` to have those sessions
-  notify-only instead. Headless `acceptEdits` still auto-approves only
-  edits and basic file commands — arbitrary Bash still has no approver and
-  doesn't run.
+- **Permission posture, stated precisely.** A resumed session **inherits the
+  original session's permission mode** — continuity of what you were running. A
+  `bypassPermissions` session resumes at `bypassPermissions`; an `acceptEdits`
+  session at `acceptEdits`. Plan-mode sessions are never auto-resumed — that's a
+  human mid-decision. A **default-mode** session (prompts before each edit) is
+  resumed at `acceptEdits` so it can work unattended — a disclosed step up; set
+  `carry-on config resume_default_mode skip` for notify-only instead.
+- **Inheriting bypass is the loaded gun — know what the default does.** If the
+  session that hit the limit ran `bypassPermissions`, its resume runs at bypass
+  too: the revived run **auto-approves every action with no human present**
+  (arbitrary Bash, deletes, network, `git push`), on your account, spending your
+  window. That's faithful continuity — the session already had bypass on — but
+  it is *more* exposed than an attended bypass session because nobody is
+  watching. Restrain it with `carry-on config deny "<globs>"` (projects it must
+  never touch), the `daily_cap` / chain caps, or downgrade every bypass resume
+  to edits-only with `carry-on config resume_bypass_mode acceptEdits` (safer,
+  but the resume then can't run git/tests/CLI).
 - **Endures many resets, still loop-proof.** A long unattended run that hits
   the limit again and again is carried on across *every* reset — the chain
   counter only trips to notify-only on **rapid** re-deaths, a fresh window
@@ -191,7 +198,10 @@ that session yourself.
 (resume|notify) · `resume_prompt` · `max_chain` (3, rapid re-deaths before
 notify-only) · `chain_decay` (seconds, default 1h — gap that clears the
 chain) · `max_wait` (seconds, default 7 days) · `probe_model` (haiku) ·
-`daily_cap` (12) · `resume_default_mode` (acceptEdits|skip) · `deny`
+`daily_cap` (12) · `resume_default_mode` (acceptEdits|skip) ·
+`resume_bypass_mode` (bypass|acceptEdits — default bypass replays the original
+session's bypass for continuity; acceptEdits downgrades it, see the trust note) ·
+`deny`
 (colon-separated globs).
 
 ## Limits of scope

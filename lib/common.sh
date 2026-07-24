@@ -130,6 +130,12 @@ cfg_chain_decay()   { config_get chain_decay 3600; }
 # acceptEdits resumes it with edits auto-approved (useful, but an unattended
 # escalation the README discloses); skip degrades it to notify-only.
 cfg_resume_default_mode() { config_get resume_default_mode acceptEdits; }
+# How to resume a session that ran in bypassPermissions. Default `bypass`
+# replays the original mode — continuity of the posture the session was already
+# running, so an unattended resume can actually run git/tests/CLI. Set
+# `acceptEdits` to downgrade instead: safer (no auto-approval of arbitrary
+# commands) but the resume then can't run non-edit tools either.
+cfg_resume_bypass_mode() { config_get resume_bypass_mode bypass; }
 cfg_resume_prompt() {
   config_get resume_prompt "Resume work. Your previous turn was interrupted by a usage-limit reset, which has now lifted. Re-read your last message and the task you were on, then continue from the next incomplete step. Do not restart work already finished and do not wait for reconfirmation — carry on to completion."
 }
