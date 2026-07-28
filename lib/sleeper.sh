@@ -77,7 +77,16 @@ expire_stale() {
 next_wake() {
   local known has_null now
   now=$(now_epoch)
-  known=$(jq -r 'select(.reset_epoch != null) | .reset_epoch' "$PENDING_DIR"/*.json 2>/dev/null | sort -n | head -1)
+  # Only FUTURE resets can shorten a wait. A reset that has already passed used
+  # to come back as the minimum, and the slice loop below — which re-reads this
+  # every slice and moves `wake` earlier whenever it can — latched onto that past
+  # value and ended the sleep after one slice. That turns the back-off into a
+  # billed probe every SLICE seconds instead of every 15-60 minutes, for as long
+  # as such a pending lives. A pending whose reset has passed is not urgent; it
+  # is waiting on the fallback schedule like any other.
+  known=$(jq -r --argjson n "$now" \
+    'select(.reset_epoch != null and .reset_epoch > $n) | .reset_epoch' \
+    "$PENDING_DIR"/*.json 2>/dev/null | sort -n | head -1)
   has_null=$(jq -r 'select(.reset_epoch == null) | "y"' "$PENDING_DIR"/*.json 2>/dev/null | head -1)
   if [ -n "$has_null" ]; then
     local fb=$((now + $(fallback_step)))
@@ -109,6 +118,8 @@ probe() {
 # same paid window, making the cap "per window OR per day, whichever comes first".
 SPEND_FILE="$DAILY_DIR/count"
 WINDOW_FILE="$DAILY_DIR/window"
+SPEND_TTL=$((6 * 3600))   # longest window we model, plus slack — see window_credit
+CLOCK_SKEW=300            # clock noise that is not a jump
 
 # Every number read back from disk is untrusted: these files are documented as
 # user-readable, and a kill or a reboot can leave one truncated mid-write. A
@@ -123,7 +134,24 @@ read_int() { # read_int FILE
 }
 
 spend_count() { read_int "$SPEND_FILE"; }
-spend_increment() { echo $(( $(spend_count) + 1 )) > "$SPEND_FILE"; }
+
+# The cap is user config, and config values are strings. A non-numeric one made
+# `[ N -ge twelve ]` throw and the comparison come back FALSE — silently
+# unlimited resumes, the exact opposite of what the key is for. Falling back to
+# the documented default is the only reading that keeps a cap a cap.
+resume_cap() {
+  local n
+  n=$(cfg_daily_cap)
+  case "$n" in "" | *[!0-9]*) n=12 ;; esac
+  printf '%s' "$n"
+}
+spend_increment() {
+  # Stamp when this window's accounting STARTED if nothing has yet, so a counter
+  # that no credit ever clears is still recognisable as stale rather than
+  # binding forever. See the staleness floor in window_credit.
+  [ "$(read_int "$WINDOW_FILE")" -gt 0 ] || printf '%s' "$(now_epoch)" > "$WINDOW_FILE"
+  echo $(( $(spend_count) + 1 )) > "$SPEND_FILE"
+}
 
 # The cap bounds resumes per unit of PAID capacity, and capacity renews at every
 # limit reset — not at midnight. A spent budget must not strand a window that
@@ -145,12 +173,26 @@ window_credit() { # window_credit [OBSERVED_EPOCH]
   if [ -n "$observed" ] && { [ -z "$boundary" ] || [ "$observed" -gt "$boundary" ]; }; then
     boundary="$observed"
   fi
-  [ -n "$boundary" ] || return 0
   seen=$(read_int "$WINDOW_FILE")
-  # A marker in the FUTURE cannot describe a boundary that has already passed —
-  # a forward clock jump wrote it. Distrust it, rather than blocking every
-  # credit until it elapses for real (up to a week, for a weekly reset).
-  [ "$seen" -gt "$now" ] && seen=0
+  # A marker beyond NOW cannot describe a boundary that has already passed — a
+  # forward clock jump wrote it. Distrust it, rather than blocking every credit
+  # until it elapses for real (up to a week, for a weekly reset). The tolerance
+  # keeps ordinary clock skew from counting as a jump. The trade is known and
+  # bounded: a backward clock step also makes the boundary that wrote the marker
+  # creditable once more, which costs one cap — far less than a week of lockout.
+  [ "$seen" -gt $((now + CLOCK_SKEW)) ] && seen=0
+  # Staleness floor. A credit is the counter's ONLY writer, so where no boundary
+  # is ever provable the cap binds permanently and every later session is capped
+  # and DELETED, silently and forever. That state is reachable: a limit message
+  # carrying no reset time, plus a fresh sleeper whose first probe succeeds
+  # because the small probe model was never limited, leaves neither proof
+  # available. A budget nothing has cleared for longer than the longest window
+  # we model is stale, not spent.
+  if [ -z "$boundary" ] && [ "$seen" -gt 0 ] && [ "$(spend_count)" -gt 0 ] &&
+    [ $((now - seen)) -gt "$SPEND_TTL" ]; then
+    boundary="$now"
+  fi
+  [ -n "$boundary" ] || return 0
   [ "$boundary" -gt "$seen" ] || return 0
   printf '%s' "$boundary" > "$WINDOW_FILE"
   echo 0 > "$SPEND_FILE"
@@ -205,9 +247,9 @@ resume_one() { # resume_one PENDING_FILE
     return
   fi
 
-  if [ "$(spend_count)" -ge "$(cfg_daily_cap)" ]; then
+  if [ "$(spend_count)" -ge "$(resume_cap)" ]; then
     history_append daily_capped "$id" "$cwd"
-    notify "carry-on: resume cap ($(cfg_daily_cap)) reached — session ${id:0:8} left resumable, not auto-resumed"
+    notify "carry-on: resume cap ($(resume_cap)) reached — session ${id:0:8} left resumable, not auto-resumed"
     notified=$((notified + 1))
     rm -f "$f"
     return
@@ -292,7 +334,11 @@ while true; do
   # Probe still limited: reschedule, preferring a reset time the probe just
   # told us — but never move an already-earlier pending later.
   attempt=$((attempt + 1))
-  limited=1
+  # Only a LIMIT arms the observed-boundary path. A probe exits nonzero for a
+  # dropped connection or a 500 just as readily, and treating that as "we were
+  # limited" would let one network blip refund the whole cap — twelve more
+  # resumes per transient error, on a probe series that runs for up to max_wait.
+  looks_limited "$probe_out" && limited=1
   fresh=$(parse_reset_epoch "$probe_out")
   if [ -n "$fresh" ]; then
     _refresh_one() {

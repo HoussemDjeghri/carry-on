@@ -91,3 +91,18 @@ parse_reset_epoch() { # parse_reset_epoch TEXT
   fi
   printf '%s' "$epoch"
 }
+
+# Does this text look like a USAGE LIMIT, as opposed to any other failure?
+#
+# A probe's exit status alone cannot answer that: `claude -p` exits nonzero for a
+# dropped connection, a 500, or a bad flag just as readily as for a limit. The
+# waker treats "was limited, now is not" as proof a new window opened, so without
+# this discriminator one network blip refunds the whole resume budget — the cap
+# becomes "N per transient error" instead of "N per window".
+#
+# A reset time is the strongest signal, but plenty of real limit messages carry
+# none ("Run /usage-credits to continue"), so the wording is checked too.
+looks_limited() { # looks_limited TEXT
+  [ -n "$(parse_reset_epoch "$1")" ] && return 0
+  printf '%s' "$1" | grep -qiE 'usage limit|rate limit|limit reached|reached your [a-z ]*limit|hit your [a-z ]*limit|usage-credits'
+}

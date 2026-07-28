@@ -51,6 +51,10 @@ fresh_env() {
   cat > "$TESTDIR/bin/claude" <<'SHIM'
 #!/bin/bash
 printf '%s\n' "$*" >> "$SHIM_STATE/calls.log"
+if [ -f "$SHIM_STATE/net-error" ] && [ ! -f "$SHIM_STATE/reset-done" ]; then
+  echo "Error: request failed, connect ECONNREFUSED 160.79.104.10:443"
+  exit 1
+fi
 if [ ! -f "$SHIM_STATE/reset-done" ]; then
   # Deliberately timestamp-free: a parseable time here would make the
   # sleeper reschedule to that wall-clock time and stall the suite.
@@ -354,6 +358,7 @@ touch "$SHIM_STATE/reset-done"
 mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
 echo "daily_cap=2" > "$CARRY_ON_HOME/config"
 echo 2 > "$CARRY_ON_HOME/daily/count"
+date +%s > "$CARRY_ON_HOME/daily/window"
 jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
   '{session_id:"s-nowindow", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:null, chain:0, caught_at:$t, retries:0, notify_only:false}' \
   > "$CARRY_ON_HOME/pending/s-nowindow.json"
@@ -419,6 +424,72 @@ jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
 "$ROOT/lib/sleeper.sh"
 check "a probe going limited -> open credits the cap with no parsed reset time" \
   bash -c "grep -q -- '--resume s-observed' '$SHIM_STATE/calls.log'"
+
+# A probe fails for many reasons. Only a LIMIT means a window was closed, so a
+# network blip must not read as one and buy a whole fresh cap.
+fresh_env
+touch "$SHIM_STATE/net-error"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+echo "daily_cap=1" > "$CARRY_ON_HOME/config"
+echo 1 > "$CARRY_ON_HOME/daily/count"
+date +%s > "$CARRY_ON_HOME/daily/window"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-blip", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:null, chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-blip.json"
+( sleep 3; touch "$SHIM_STATE/reset-done" ) &
+"$ROOT/lib/sleeper.sh"
+check "a non-limit probe failure does not refund the cap" \
+  bash -c "! grep -q -- '--resume s-blip' '$SHIM_STATE/calls.log'"
+
+# A credit is the counter's only writer, so a budget nothing has cleared for
+# longer than the longest window we model is stale, not spent — otherwise the
+# cap binds forever and every later session is capped and deleted.
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+echo "daily_cap=1" > "$CARRY_ON_HOME/config"
+echo 1 > "$CARRY_ON_HOME/daily/count"
+echo $(( $(date +%s) - 7 * 3600 )) > "$CARRY_ON_HOME/daily/window"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-stale", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:null, chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-stale.json"
+"$ROOT/lib/sleeper.sh"
+check "a counter no credit has cleared in a full window is stale, not spent" \
+  bash -c "grep -q -- '--resume s-stale' '$SHIM_STATE/calls.log'"
+
+# A non-numeric cap made `[ N -ge twelve ]` throw and come back false: silently
+# unlimited resumes, the opposite of what the key is for.
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+echo "daily_cap=twelve" > "$CARRY_ON_HOME/config"
+echo 99 > "$CARRY_ON_HOME/daily/count"
+date +%s > "$CARRY_ON_HOME/daily/window"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-badcap", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:null, chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-badcap.json"
+"$ROOT/lib/sleeper.sh"
+check "a non-numeric cap falls back to the default, never to unlimited" \
+  bash -c "! grep -q -- '--resume s-badcap' '$SHIM_STATE/calls.log' && grep -q '\"event\":\"daily_capped\"' '$CARRY_ON_HOME/history.jsonl'"
+check "config rejects a non-numeric cap outright" \
+  bash -c "! '$ROOT/bin/carry-on' config daily_cap twelve"
+
+# A reset that has already passed must not shorten the wait: the slice loop
+# re-reads it every slice, so a past epoch collapsed the back-off to one slice
+# and turned a 15-60 minute probe schedule into a billed probe every minute.
+fresh_env
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+CARRY_ON_FALLBACK_STEPS="5 5 5" \
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-backoff", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t-100), chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-backoff.json"
+( CARRY_ON_FALLBACK_STEPS="5 5 5"; export CARRY_ON_FALLBACK_STEPS; "$ROOT/lib/sleeper.sh" ) &
+sleeper_pid=$!
+sleep 6
+kill "$sleeper_pid" 2>/dev/null; wait "$sleeper_pid" 2>/dev/null
+reap
+check "a past reset does not collapse the probe back-off to one slice" \
+  bash -c "test \"\$(grep -c -- '-p Reply' '$SHIM_STATE/calls.log')\" -le 3"
 
 fresh_env
 touch "$SHIM_STATE/reset-done"

@@ -7,7 +7,7 @@
 
 <p>
   <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-D97757">
-  <img alt="version 0.1.2" src="https://img.shields.io/badge/version-0.1.2-191919">
+  <img alt="version 0.1.5" src="https://img.shields.io/badge/version-0.1.2-191919">
   <img alt="dependencies: bash and jq" src="https://img.shields.io/badge/deps-bash%20%2B%20jq-D4A27F">
   <img alt="no daemon" src="https://img.shields.io/badge/no-daemon-555">
 </p>
@@ -186,9 +186,11 @@ that session yourself.
   burned through inside `chain_decay` (default 1h). That's the signature of a
   resume loop; healthy usage spaced hours apart clears the counter and keeps
   going. A global cap (default 12, `daily_cap`) still bounds unattended spend
-  across ALL sessions — counted per **window**, not per calendar day: it starts
-  over each time a limit resets, because that reset is what makes the next
-  resume affordable. A day whose budget is already spent must never strand a
+  across ALL sessions — counted per **window**, not per calendar day. It starts
+  over when a new window can be PROVEN: a reset time the limit message carried
+  has passed, or a probe went from limited to open. Where neither is ever
+  available it starts over anyway once nothing has cleared it for longer than a
+  full window, so a spent budget can never bind forever. A day whose budget is already spent must never strand a
   window that has reopened. When the cap does bind, it binds on the STALEST
   pending: sessions are served newest-catch first.
 - **Deny list.** `carry-on config deny "$HOME/sensitive*:$HOME/other*"`

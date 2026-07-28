@@ -117,7 +117,9 @@ cmd_config() {
     mode) case "$value" in resume|notify) ;; *) die "mode is resume|notify" ;; esac ;;
     resume_default_mode) case "$value" in acceptEdits|skip) ;; *) die "resume_default_mode is acceptEdits|skip" ;; esac ;;
     resume_bypass_mode) case "$value" in acceptEdits|bypass) ;; *) die "resume_bypass_mode is acceptEdits|bypass" ;; esac ;;
-    enabled|max_chain|chain_decay|max_wait|probe_model|daily_cap|deny|resume_prompt) ;;
+    max_chain|chain_decay|max_wait|daily_cap)
+      case "$value" in "" | *[!0-9]*) die "$key must be a whole number, got '$value'" ;; esac ;;
+    enabled|probe_model|deny|resume_prompt) ;;
     *) die "unknown key '$key' (enabled mode resume_prompt max_chain chain_decay max_wait probe_model daily_cap resume_default_mode resume_bypass_mode deny)" ;;
   esac
   config_set "$key" "$value"
