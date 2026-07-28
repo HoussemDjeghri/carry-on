@@ -21,6 +21,7 @@ SLICE="${CARRY_ON_SLICE:-60}"
 # Fallback wait steps (seconds) when no reset time is known: 15m, 30m, then hourly.
 FALLBACK_STEPS="${CARRY_ON_FALLBACK_STEPS:-900 1800 3600}"
 attempt=0
+limited=0   # did a probe in this sleeper's life come back still limited?
 CLAUDE="$(claude_bin)"   # resolve once; the detached env may drift over days
 
 # Exit is deliberate-only: drop the lock, then re-check — if a catcher added
@@ -102,28 +103,57 @@ probe() {
   "$CLAUDE" -p "Reply with exactly: OK" --model "$(cfg_probe_model)" --max-turns 1 2>&1
 }
 
-daily_count() { cat "$DAILY_DIR/$(date +%Y-%m-%d)" 2>/dev/null || echo 0; }
-daily_increment() { echo $(( $(daily_count) + 1 )) > "$DAILY_DIR/$(date +%Y-%m-%d)"; }
+# Spend is counted per WINDOW, so it lives in ONE file that only a window credit
+# clears. Keying it to the calendar date left a second refund nobody asked for:
+# a window opening at 22:00 got its whole cap back at 00:05, still inside the
+# same paid window, making the cap "per window OR per day, whichever comes first".
+SPEND_FILE="$DAILY_DIR/count"
+WINDOW_FILE="$DAILY_DIR/window"
+
+# Every number read back from disk is untrusted: these files are documented as
+# user-readable, and a kill or a reboot can leave one truncated mid-write. A
+# non-integer counts as zero rather than making `[` throw "integer expression
+# expected" and take a branch nobody chose — an empty window marker used to
+# disable crediting permanently and silently that way.
+read_int() { # read_int FILE
+  local n
+  n=$(cat "$1" 2>/dev/null || echo 0)
+  case "$n" in "" | *[!0-9]*) n=0 ;; esac
+  printf '%s' "$n"
+}
+
+spend_count() { read_int "$SPEND_FILE"; }
+spend_increment() { echo $(( $(spend_count) + 1 )) > "$SPEND_FILE"; }
 
 # The cap bounds resumes per unit of PAID capacity, and capacity renews at every
-# limit reset — not at midnight. A day's spend must not strand a window that has
-# already reopened: twelve resumes spent by early afternoon once left a reset
-# two hours later entirely unused, with live sessions still pending inside it.
-# So the first time we serve a window newer than the one the counter was
-# counting, the counter starts over. The boundary is the latest reset a pending
-# actually RECORDED and that has since passed — never `now`, which would clear
-# the counter on every probe and retire the cap altogether.
-window_credit() {
-  local now boundary seen
+# limit reset — not at midnight. A spent budget must not strand a window that
+# has already reopened: twelve resumes spent by early afternoon once left a
+# reset two hours later entirely unused, with live sessions pending inside it.
+# So the counter starts over the first time we can PROVE a new window began.
+# Two proofs, both real:
+#   - a reset time a pending RECORDED that is now behind us, and
+#   - a probe that succeeds after one failed — the account was limited and is
+#     not any more, which is the only evidence available at all when the limit
+#     message carried no parseable reset time (a documented case).
+# Never `now` on its own: that would credit on every probe and retire the cap.
+window_credit() { # window_credit [OBSERVED_EPOCH]
+  local now boundary seen observed="${1:-}"
   now=$(now_epoch)
   boundary=$(jq -r --argjson n "$now" \
     'select(.reset_epoch != null and .reset_epoch <= $n) | .reset_epoch' \
     "$PENDING_DIR"/*.json 2>/dev/null | sort -n | tail -1)
+  if [ -n "$observed" ] && { [ -z "$boundary" ] || [ "$observed" -gt "$boundary" ]; }; then
+    boundary="$observed"
+  fi
   [ -n "$boundary" ] || return 0
-  seen=$(cat "$DAILY_DIR/window" 2>/dev/null || echo 0)
+  seen=$(read_int "$WINDOW_FILE")
+  # A marker in the FUTURE cannot describe a boundary that has already passed —
+  # a forward clock jump wrote it. Distrust it, rather than blocking every
+  # credit until it elapses for real (up to a week, for a weekly reset).
+  [ "$seen" -gt "$now" ] && seen=0
   [ "$boundary" -gt "$seen" ] || return 0
-  printf '%s' "$boundary" > "$DAILY_DIR/window"
-  echo 0 > "$DAILY_DIR/$(date +%Y-%m-%d)"
+  printf '%s' "$boundary" > "$WINDOW_FILE"
+  echo 0 > "$SPEND_FILE"
 }
 
 resumed=0; failed=0; notified=0
@@ -175,7 +205,7 @@ resume_one() { # resume_one PENDING_FILE
     return
   fi
 
-  if [ "$(daily_count)" -ge "$(cfg_daily_cap)" ]; then
+  if [ "$(spend_count)" -ge "$(cfg_daily_cap)" ]; then
     history_append daily_capped "$id" "$cwd"
     notify "carry-on: resume cap ($(cfg_daily_cap)) reached — session ${id:0:8} left resumable, not auto-resumed"
     notified=$((notified + 1))
@@ -193,7 +223,7 @@ resume_one() { # resume_one PENDING_FILE
   : > "$RESUMING_DIR/$id"
   if (cd "$cwd" && "$CLAUDE" --resume "$id" -p "$prompt" --permission-mode "$pmode") > "$out" 2>&1; then
     resumed=$((resumed + 1)); history_append resumed "$id" "$cwd"
-    chain_increment "$id"; daily_increment
+    chain_increment "$id"; spend_increment
     # The continued transcript is now on disk. Flag the still-open TUI to
     # reattach and see it; SessionStart clears this when the user reattaches.
     : > "$RESUMED_DIR/$id"
@@ -203,7 +233,12 @@ resume_one() { # resume_one PENDING_FILE
     # small model doesn't share) get one bounded retry on the fallback
     # schedule before the pending is declared lost.
     if [ "$retries" -lt 1 ]; then
-      jq -c '.retries += 1 | .reset_epoch = null' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+      # Keep reset_epoch. It is this pending's only record of which window it
+      # belongs to, and a retry that erases it can never have the cap credited
+      # on its behalf — it gets capped and DELETED on the retry pass, so the
+      # one bounded retry silently becomes no retry. Timing is unaffected: a
+      # reset already in the past sends next_wake to the fallback schedule.
+      jq -c '.retries += 1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
       history_append resume_retry "$id" "$cwd"
     else
       failed=$((failed + 1)); history_append resume_failed "$id" "$cwd"
@@ -237,7 +272,11 @@ while true; do
   pending_exists || { finish || continue; }
 
   if probe_out=$(probe); then
-    window_credit
+    # A probe that succeeds after one failed IS a window boundary, observed
+    # first-hand: the account was limited a moment ago and is not now. It is
+    # the only proof available when the limit message named no reset time.
+    if [ "$limited" -eq 1 ]; then window_credit "$(now_epoch)"; else window_credit; fi
+    limited=0
     resumed=0; failed=0; notified=0
     each_pending resume_one
     total=$((resumed + failed + notified))
@@ -253,6 +292,7 @@ while true; do
   # Probe still limited: reschedule, preferring a reset time the probe just
   # told us — but never move an already-earlier pending later.
   attempt=$((attempt + 1))
+  limited=1
   fresh=$(parse_reset_epoch "$probe_out")
   if [ -n "$fresh" ]; then
     _refresh_one() {

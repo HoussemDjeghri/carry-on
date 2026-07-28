@@ -338,7 +338,7 @@ fresh_env
 touch "$SHIM_STATE/reset-done"
 mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
 echo "daily_cap=2" > "$CARRY_ON_HOME/config"
-echo 2 > "$CARRY_ON_HOME/daily/$(date +%Y-%m-%d)"
+echo 2 > "$CARRY_ON_HOME/daily/count"
 now=$(date +%s)
 jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$now" \
   '{session_id:"s-window", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t-1), chain:0, caught_at:$t, retries:0, notify_only:false}' \
@@ -353,13 +353,72 @@ fresh_env
 touch "$SHIM_STATE/reset-done"
 mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
 echo "daily_cap=2" > "$CARRY_ON_HOME/config"
-echo 2 > "$CARRY_ON_HOME/daily/$(date +%Y-%m-%d)"
+echo 2 > "$CARRY_ON_HOME/daily/count"
 jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
   '{session_id:"s-nowindow", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:null, chain:0, caught_at:$t, retries:0, notify_only:false}' \
   > "$CARRY_ON_HOME/pending/s-nowindow.json"
 "$ROOT/lib/sleeper.sh"
 check "no elapsed reset -> the cap still binds" \
   bash -c "! grep -q -- '--resume s-nowindow' '$SHIM_STATE/calls.log' && grep -q '\"event\":\"daily_capped\"' '$CARRY_ON_HOME/history.jsonl'"
+
+# Spend is per WINDOW, so a date-named counter file must be inert. Keying it to
+# the date handed out a second refund at midnight, inside the same paid window.
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+echo "daily_cap=1" > "$CARRY_ON_HOME/config"
+echo 1 > "$CARRY_ON_HOME/daily/$(date +%Y-%m-%d)"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-datefile", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:null, chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-datefile.json"
+"$ROOT/lib/sleeper.sh"
+check "spend is not keyed to the calendar date" \
+  bash -c "grep -q -- '--resume s-datefile' '$SHIM_STATE/calls.log'"
+
+# A truncated marker (kill mid-write, reboot, a user editing state) must not
+# silently disable crediting forever: `[ "\$b" -gt "" ]` errors and returns.
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+echo "daily_cap=1" > "$CARRY_ON_HOME/config"
+echo 1 > "$CARRY_ON_HOME/daily/count"
+: > "$CARRY_ON_HOME/daily/window"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-emptymark", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t-1), chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-emptymark.json"
+"$ROOT/lib/sleeper.sh"
+check "an empty window marker does not disable crediting" \
+  bash -c "grep -q -- '--resume s-emptymark' '$SHIM_STATE/calls.log'"
+
+# A marker in the future was written by a clock that was wrong; once the clock
+# is fixed it would block every real boundary until it elapsed for real.
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+echo "daily_cap=1" > "$CARRY_ON_HOME/config"
+echo 1 > "$CARRY_ON_HOME/daily/count"
+echo $(( $(date +%s) + 999999 )) > "$CARRY_ON_HOME/daily/window"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-futuremark", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t-1), chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-futuremark.json"
+"$ROOT/lib/sleeper.sh"
+check "a future window marker is distrusted, not obeyed" \
+  bash -c "grep -q -- '--resume s-futuremark' '$SHIM_STATE/calls.log'"
+
+# When the limit message carried no reset time, a probe going limited -> open is
+# the ONLY evidence a window began; without it a spent cap strands the session
+# the fix exists to save. No reset-done marker: the first probe is limited.
+fresh_env
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+echo "daily_cap=1" > "$CARRY_ON_HOME/config"
+echo 1 > "$CARRY_ON_HOME/daily/count"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-observed", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:null, chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-observed.json"
+( sleep 3; touch "$SHIM_STATE/reset-done" ) &
+"$ROOT/lib/sleeper.sh"
+check "a probe going limited -> open credits the cap with no parsed reset time" \
+  bash -c "grep -q -- '--resume s-observed' '$SHIM_STATE/calls.log'"
 
 fresh_env
 touch "$SHIM_STATE/reset-done"
