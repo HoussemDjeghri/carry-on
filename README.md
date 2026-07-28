@@ -185,8 +185,12 @@ that session yourself.
   counter only trips to notify-only on **rapid** re-deaths, a fresh window
   burned through inside `chain_decay` (default 1h). That's the signature of a
   resume loop; healthy usage spaced hours apart clears the counter and keeps
-  going. A global daily cap (default 12 resumes/day, `daily_cap`) still bounds
-  total unattended spend across ALL sessions.
+  going. A global cap (default 12, `daily_cap`) still bounds unattended spend
+  across ALL sessions — counted per **window**, not per calendar day: it starts
+  over each time a limit resets, because that reset is what makes the next
+  resume affordable. A day whose budget is already spent must never strand a
+  window that has reopened. When the cap does bind, it binds on the STALEST
+  pending: sessions are served newest-catch first.
 - **Deny list.** `carry-on config deny "$HOME/sensitive*:$HOME/other*"`
   keeps chosen projects out entirely.
 - All state is plain files under `~/.claude/carry-on/` — read them any time.
@@ -198,7 +202,8 @@ that session yourself.
 (resume|notify) · `resume_prompt` · `max_chain` (3, rapid re-deaths before
 notify-only) · `chain_decay` (seconds, default 1h — gap that clears the
 chain) · `max_wait` (seconds, default 7 days) · `probe_model` (haiku) ·
-`daily_cap` (12) · `resume_default_mode` (acceptEdits|skip) ·
+`daily_cap` (12 resumes per limit window, all sessions) ·
+`resume_default_mode` (acceptEdits|skip) ·
 `resume_bypass_mode` (bypass|acceptEdits — default bypass replays the original
 session's bypass for continuity; acceptEdits downgrades it, see the trust note) ·
 `deny`

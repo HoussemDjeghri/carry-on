@@ -314,6 +314,53 @@ jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
 check "daily cap -> not resumed, capped event recorded" \
   bash -c "! grep -q -- '--resume s-capped' '$SHIM_STATE/calls.log' && grep -q '\"event\":\"daily_capped\"' '$CARRY_ON_HOME/history.jsonl'"
 
+# A cap that must bind has to bind on the STALEST pending. Serving in glob order
+# spends it on whichever session id sorts first: a 22-pending backlog once ate a
+# whole day's cap that way and left the session that mattered capped.
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+echo "daily_cap=1" > "$CARRY_ON_HOME/config"
+now=$(date +%s)
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$now" \
+  '{session_id:"s-aaa-stale", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t-1), chain:0, caught_at:($t-86400), retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-aaa-stale.json"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$now" \
+  '{session_id:"s-zzz-fresh", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t-1), chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-zzz-fresh.json"
+"$ROOT/lib/sleeper.sh"
+check "cap binds on the stalest pending, not on glob order" \
+  bash -c "grep -q -- '--resume s-zzz-fresh' '$SHIM_STATE/calls.log' && ! grep -q -- '--resume s-aaa-stale' '$SHIM_STATE/calls.log'"
+
+# Capacity renews at every limit reset, not at midnight: a day's spend must never
+# strand a window that has already reopened.
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+echo "daily_cap=2" > "$CARRY_ON_HOME/config"
+echo 2 > "$CARRY_ON_HOME/daily/$(date +%Y-%m-%d)"
+now=$(date +%s)
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$now" \
+  '{session_id:"s-window", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t-1), chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-window.json"
+"$ROOT/lib/sleeper.sh"
+check "an elapsed reset refunds the cap -- a spent day never strands a fresh window" \
+  bash -c "grep -q -- '--resume s-window' '$SHIM_STATE/calls.log'"
+
+# ...and the refund is the WINDOW's, not the clock's: with no reset boundary to
+# credit, the cap still binds, or it would not be a cap at all.
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+echo "daily_cap=2" > "$CARRY_ON_HOME/config"
+echo 2 > "$CARRY_ON_HOME/daily/$(date +%Y-%m-%d)"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-nowindow", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:null, chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-nowindow.json"
+"$ROOT/lib/sleeper.sh"
+check "no elapsed reset -> the cap still binds" \
+  bash -c "! grep -q -- '--resume s-nowindow' '$SHIM_STATE/calls.log' && grep -q '\"event\":\"daily_capped\"' '$CARRY_ON_HOME/history.jsonl'"
+
 fresh_env
 touch "$SHIM_STATE/reset-done"
 mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs"

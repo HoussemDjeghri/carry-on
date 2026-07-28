@@ -36,12 +36,21 @@ finish() {
 }
 trap 'rm -rf "$LOCK_DIR"' TERM INT
 
+# Newest catch first. When the cap binds it has to bind on the STALEST pending,
+# and glob order spends it on whichever session id sorts first instead — a
+# backlog of 22 pendings once ate a whole cap that way while the session that
+# mattered was capped. Listing before calling also makes it safe for a callback
+# to delete its own file, which every callback here does.
 each_pending() { # each_pending CALLBACK  (callback FILE; skips vanished files)
   local f
-  for f in "$PENDING_DIR"/*.json; do
-    [ -f "$f" ] || continue
-    "$1" "$f"
-  done
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$f" ] && "$1" "$f"
+  done < <(
+    for f in "$PENDING_DIR"/*.json; do
+      [ -f "$f" ] || continue
+      printf '%s\t%s\n' "$(jq -r '.caught_at // 0' "$f" 2>/dev/null || echo 0)" "$f"
+    done | sort -rn -k1,1 | cut -f2-
+  )
 }
 
 expire_stale() {
@@ -96,6 +105,27 @@ probe() {
 daily_count() { cat "$DAILY_DIR/$(date +%Y-%m-%d)" 2>/dev/null || echo 0; }
 daily_increment() { echo $(( $(daily_count) + 1 )) > "$DAILY_DIR/$(date +%Y-%m-%d)"; }
 
+# The cap bounds resumes per unit of PAID capacity, and capacity renews at every
+# limit reset — not at midnight. A day's spend must not strand a window that has
+# already reopened: twelve resumes spent by early afternoon once left a reset
+# two hours later entirely unused, with live sessions still pending inside it.
+# So the first time we serve a window newer than the one the counter was
+# counting, the counter starts over. The boundary is the latest reset a pending
+# actually RECORDED and that has since passed — never `now`, which would clear
+# the counter on every probe and retire the cap altogether.
+window_credit() {
+  local now boundary seen
+  now=$(now_epoch)
+  boundary=$(jq -r --argjson n "$now" \
+    'select(.reset_epoch != null and .reset_epoch <= $n) | .reset_epoch' \
+    "$PENDING_DIR"/*.json 2>/dev/null | sort -n | tail -1)
+  [ -n "$boundary" ] || return 0
+  seen=$(cat "$DAILY_DIR/window" 2>/dev/null || echo 0)
+  [ "$boundary" -gt "$seen" ] || return 0
+  printf '%s' "$boundary" > "$DAILY_DIR/window"
+  echo 0 > "$DAILY_DIR/$(date +%Y-%m-%d)"
+}
+
 resumed=0; failed=0; notified=0
 
 resume_one() { # resume_one PENDING_FILE
@@ -147,7 +177,7 @@ resume_one() { # resume_one PENDING_FILE
 
   if [ "$(daily_count)" -ge "$(cfg_daily_cap)" ]; then
     history_append daily_capped "$id" "$cwd"
-    notify "carry-on: daily resume cap ($(cfg_daily_cap)) reached — session ${id:0:8} left resumable, not auto-resumed"
+    notify "carry-on: resume cap ($(cfg_daily_cap)) reached — session ${id:0:8} left resumable, not auto-resumed"
     notified=$((notified + 1))
     rm -f "$f"
     return
@@ -207,6 +237,7 @@ while true; do
   pending_exists || { finish || continue; }
 
   if probe_out=$(probe); then
+    window_credit
     resumed=0; failed=0; notified=0
     each_pending resume_one
     total=$((resumed + failed + notified))
