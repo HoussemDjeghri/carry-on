@@ -56,6 +56,10 @@ if [ -f "$SHIM_STATE/net-error" ] && [ ! -f "$SHIM_STATE/reset-done" ]; then
   exit 1
 fi
 if [ ! -f "$SHIM_STATE/reset-done" ]; then
+  # Record that a call actually TOOK the limited branch. A test that needs "one
+  # probe was refused before the window opened" can then wait for that fact
+  # instead of racing a fixed sleep against the sleeper's first probe.
+  echo x >> "$SHIM_STATE/limited.log"
   # Deliberately timestamp-free: a parseable time here would make the
   # sleeper reschedule to that wall-clock time and stall the suite.
   echo "You've hit your usage limit"
@@ -124,8 +128,12 @@ check "pending parsed reset epoch from message" bash -c "jq -re '.reset_epoch !=
 check "catch notifies" grep -q "limit hit" "$CARRY_ON_NOTIFY_LOG"
 check "catch appends history" grep -q '"event":"caught"' "$CARRY_ON_HOME/history.jsonl"
 # The spawn path itself — the exact line a platform without setsid breaks.
+# 15s, not 3s. This waits on a detached nohup/setsid spawn reaching the point
+# where it writes its pid — the one thing here whose latency is the machine's,
+# not the code's. A budget tight enough to expire under load turns a platform
+# assertion into a load assertion, and a red here reads as "detach is broken".
 spawn_ok=false
-for _ in 1 2 3 4 5 6; do
+for _ in $(seq 30); do
   spid=$(cat "$CARRY_ON_HOME/sleeper.lock/pid" 2>/dev/null || true)
   [ -n "$spid" ] && kill -0 "$spid" 2>/dev/null && { spawn_ok=true; break; }
   sleep 0.5
@@ -191,11 +199,18 @@ jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
   '{session_id:"s-cycle", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t+1), chain:0, caught_at:$t}' \
   > "$CARRY_ON_HOME/pending/s-cycle.json"; }
 mkdir -p "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains"
-# First probe is limited (no reset-done marker); create it after 3s so the
-# second probe succeeds — exercises the probe-reschedule path.
-( sleep 3; touch "$SHIM_STATE/reset-done" ) &
+# First probe is limited; the window opens only once a probe has actually been
+# REFUSED, so the reschedule path is exercised no matter how loaded the machine
+# is. A fixed `sleep 3` raced the sleeper: under load it reached its first probe
+# after the marker already existed, succeeded first time, and the test red for a
+# reason that had nothing to do with the code.
+( for _ in $(seq 150); do [ -s "$SHIM_STATE/limited.log" ] && break; sleep 0.2; done
+  touch "$SHIM_STATE/reset-done" ) &   # bounded: never wait forever if no probe comes
 "$ROOT/lib/sleeper.sh"
-check "probe was limited then retried (>=2 probes)" bash -c "grep -c -- '-p Reply' '$SHIM_STATE/calls.log' | grep -qE '^[2-9]'"
+# Numeric, not a leading-digit pattern: `^[2-9]` also rejects 10 and up, so the
+# assertion had an invisible upper bound it never meant to have.
+check "probe was limited then retried (>=2 probes)" \
+  bash -c "[ \"\$(grep -c -- '-p Reply' '$SHIM_STATE/calls.log')\" -ge 2 ]"
 check "resume invoked with --resume s-cycle" grep -q -- "--resume s-cycle" "$SHIM_STATE/calls.log"
 check "resume used recorded permission mode" grep -q -- "--permission-mode acceptEdits" "$SHIM_STATE/calls.log"
 check "pending cleared after resume" test ! -f "$CARRY_ON_HOME/pending/s-cycle.json"
@@ -499,13 +514,20 @@ CARRY_ON_FALLBACK_STEPS="5 5 5" \
 jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
   '{session_id:"s-backoff", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t-100), chain:0, caught_at:$t, retries:0, notify_only:false}' \
   > "$CARRY_ON_HOME/pending/s-backoff.json"
+backoff_t0=$SECONDS
 ( CARRY_ON_FALLBACK_STEPS="5 5 5"; export CARRY_ON_FALLBACK_STEPS; "$ROOT/lib/sleeper.sh" ) &
 sleeper_pid=$!
 sleep 6
 kill "$sleeper_pid" 2>/dev/null; wait "$sleeper_pid" 2>/dev/null
+backoff_elapsed=$((SECONDS - backoff_t0))
 reap
+# The bar scales with the time the sleeper actually got, because a fixed count
+# over a `sleep 6` that overruns under load counts probes the schedule was
+# entitled to make. With SLICE=1 and 5s steps, correct behaviour is ~1 probe per
+# 5s and the collapse is ~1 per second, so half the elapsed seconds separates
+# them at any duration.
 check "a past reset does not collapse the probe back-off to one slice" \
-  bash -c "test \"\$(grep -c -- '-p Reply' '$SHIM_STATE/calls.log')\" -le 3"
+  bash -c "[ \"\$(grep -c -- '-p Reply' '$SHIM_STATE/calls.log')\" -le $(( backoff_elapsed / 2 + 1 )) ]"
 
 fresh_env
 touch "$SHIM_STATE/reset-done"
@@ -545,8 +567,12 @@ jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
   '{session_id:"s-strand", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t+900), chain:0, caught_at:$t, retries:0, notify_only:false}' \
   > "$CARRY_ON_HOME/pending/s-strand.json"
 printf '{"session_id":"s-r2","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh" >/dev/null
+# 15s, not 3s. This waits on a detached nohup/setsid spawn reaching the point
+# where it writes its pid — the one thing here whose latency is the machine's,
+# not the code's. A budget tight enough to expire under load turns a platform
+# assertion into a load assertion, and a red here reads as "detach is broken".
 spawn_ok=false
-for _ in 1 2 3 4 5 6; do
+for _ in $(seq 30); do
   spid=$(cat "$CARRY_ON_HOME/sleeper.lock/pid" 2>/dev/null || true)
   [ -n "$spid" ] && kill -0 "$spid" 2>/dev/null && { spawn_ok=true; break; }
   sleep 0.5
