@@ -66,7 +66,10 @@ case "$*" in
     # `claude -p` reads piped stdin, so the real binary drains whatever it is
     # given. Model that, and record it: if the sleeper hands the resume its
     # pending queue, this file is where the evidence lands.
-    cat > "$SHIM_STATE/resume-stdin.log" 2>/dev/null
+    # APPEND, never truncate. The first child is the one that eats the queue;
+    # every child after it is handed the drained end and writes nothing, so a
+    # truncating redirect erased the evidence before the assertion ever saw it.
+    cat >> "$SHIM_STATE/resume-stdin.log" 2>/dev/null
     echo "resumed-and-continued"; exit "${SHIM_RESUME_EXIT:-0}" ;;
   *) echo "OK" ;;
 esac
@@ -755,10 +758,40 @@ for s in s-q1 s-q2 s-q3; do
     > "$CARRY_ON_HOME/pending/$s.json"
 done
 "$ROOT/lib/sleeper.sh"
+# ONE pass means ONE probe. The resume tally alone cannot tell the two apart:
+# a child that eats the queue off stdin ends the pass after one session, and the
+# rest come back on later cycles — three resumes either way. Each of those extra
+# cycles is a fresh billed probe, which is the cost being guarded, so the probe
+# count is the assertion that has teeth.
 check "every queued pending is resumed in one pass, not one per cycle" \
-  bash -c "[ \"\$(grep -c -- '--resume' '$SHIM_STATE/calls.log')\" = 3 ]"
+  bash -c "[ \"\$(grep -c -- '--resume' '$SHIM_STATE/calls.log')\" = 3 ] &&
+           [ \"\$(grep -c 'Reply with exactly' '$SHIM_STATE/calls.log')\" = 1 ]"
 check "the resume child is handed no stdin (the queue is not its input)" \
   bash -c "[ ! -s '$SHIM_STATE/resume-stdin.log' ]"
+
+# ────────── a real resume stamps the spend clock, not the window ──────────
+# Every other staleness test seeds daily/spend_started by hand, which leaves the
+# code that CREATES it untested: repointing that write at the window marker kept
+# the whole suite green. Spend through an actual resume and read both files.
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-spend", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:null,
+    chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-spend.json"
+"$ROOT/lib/sleeper.sh"
+check "a resume spends the budget" \
+  bash -c "[ \"\$(cat '$CARRY_ON_HOME/daily/count' 2>/dev/null)\" = 1 ]"
+check "the first spend stamps the spend clock with now" \
+  bash -c "s=\$(cat '$CARRY_ON_HOME/daily/spend_started' 2>/dev/null);
+           case \"\$s\" in ''|*[!0-9]*) exit 1 ;; esac
+           [ \$(( \$(date +%s) - s )) -lt 300 ]"
+# No pending carried a reset epoch and no probe ever failed, so nothing proved a
+# boundary — a window marker here could only have come from the spend writing to
+# the wrong file, which is precisely the mutation the suite used to sleep through.
+check "spending does not write a window marker no boundary proved" \
+  bash -c "[ ! -s '$CARRY_ON_HOME/daily/window' ]"
 
 # ────────── a boundary credited long ago is not a stale budget ──────────
 # The staleness floor measures when SPENDING started, never the boundary last
