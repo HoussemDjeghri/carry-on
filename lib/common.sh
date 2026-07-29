@@ -74,17 +74,17 @@ ensure_sleeper() { # ensure_sleeper PLUGIN_ROOT
     return 0
   fi
 
-  # Lock held. Alive sleeper (fresh pid) → nothing to do.
+  # Lock held. Our sleeper, still running → nothing to do.
   local pid
   pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+  if sleeper_alive "$pid"; then
     return 0
   fi
   # Stale: dead pid, or no pid ever appeared (spawn failed) and the lock is
   # old enough that a healthy sleeper would have written one. Steal
   # atomically via mv so two concurrent stealers can't both proceed.
   local spawned
-  spawned=$(cat "$LOCK_DIR/spawned_at" 2>/dev/null || echo 0)
+  spawned=$(read_int "$LOCK_DIR/spawned_at")
   if [ -n "$pid" ] || [ $(( $(now_epoch) - spawned )) -gt 60 ]; then
     if mv "$LOCK_DIR" "$LOCK_DIR.stale.$$" 2>/dev/null; then
       rm -rf "$LOCK_DIR.stale.$$"
@@ -104,6 +104,43 @@ config_get() { # config_get KEY DEFAULT
   printf '%s' "${val:-$2}"
 }
 
+# A count read back from disk, or the fallback when the file holds anything that
+# is not one. These files are documented as user-readable, and `echo N > file` is
+# not atomic — a kill, a reboot or a full disk can leave one zero-length or torn.
+# An empty string then flows into `[ "$n" -ge … ]`, which THROWS and takes a
+# branch nobody chose, or into jq's --argjson, which rejects it and silently
+# skips the write that was the whole point of the call.
+read_int() { # read_int FILE [DEFAULT]
+  local n
+  n=$(cat "$1" 2>/dev/null || printf '%s' "${2:-0}")
+  case "$n" in "" | *[!0-9]*) n="${2:-0}" ;; esac
+  printf '%s' "$n"
+}
+
+# The same reading applied to config, which is a user-edited file of strings.
+# A non-numeric cap made its comparison throw and come back FALSE — silently
+# UNLIMITED, the exact opposite of what a cap is for. Every numeric key gets the
+# documented default rather than the failure-open branch.
+config_int() { # config_int KEY DEFAULT
+  local n
+  n=$(config_get "$1" "$2")
+  case "$n" in "" | *[!0-9]*) n="$2" ;; esac
+  printf '%s' "$n"
+}
+
+# Is PID our sleeper? Liveness alone does not answer that, and every caller here
+# needs the stronger claim. The lock dir and its pid file outlive a reboot on
+# disk, and the OS recycles pids: once an unrelated process lands on that number,
+# `kill -0` says "healthy sleeper" and every recovery path returns having done
+# nothing, so a pending stranded by the reboot is never resumed, never notified
+# and never expired — expire_stale runs only inside the sleeper that never
+# started. `cancel` failed harder still: it signalled that pid AND its children.
+sleeper_alive() { # sleeper_alive PID
+  [ -n "${1:-}" ] || return 1
+  kill -0 "$1" 2>/dev/null || return 1
+  ps -o command= -p "$1" 2>/dev/null | grep -q 'sleeper\.sh'
+}
+
 config_set() { # config_set KEY VALUE
   ensure_dirs
   touch "$CONFIG_FILE"
@@ -116,11 +153,11 @@ config_set() { # config_set KEY VALUE
 
 cfg_enabled()       { config_get enabled true; }
 cfg_mode()          { config_get mode resume; }
-cfg_max_chain()     { config_get max_chain 3; }
-cfg_max_wait()      { config_get max_wait 604800; }   # 7 days
+cfg_max_chain()     { config_int max_chain 3; }
+cfg_max_wait()      { config_int max_wait 604800; }   # 7 days
 cfg_deny()          { config_get deny ""; }
 cfg_probe_model()   { config_get probe_model haiku; }
-cfg_daily_cap()     { config_get daily_cap 12; }
+cfg_daily_cap()     { config_int daily_cap 12; }
 # Gap (seconds) after which a fresh limit hit is treated as healthy usage that
 # ran a full window rather than a runaway resume loop — it clears the chain.
 # Only rapid re-deaths (a fresh window burned through faster than this)
@@ -174,7 +211,7 @@ claude_bin() {
 }
 
 chain_count() { # chain_count SESSION_ID
-  cat "$CHAINS_DIR/$1" 2>/dev/null || echo 0
+  read_int "$CHAINS_DIR/$1"
 }
 
 chain_increment() { # chain_increment SESSION_ID

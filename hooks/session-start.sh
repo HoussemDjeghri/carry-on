@@ -75,7 +75,7 @@ ensure_dirs
 # Report resumes for this cwd that happened after the last report here.
 # Tolerant parse: one torn history line must not silence the report forever.
 marker="$LASTSEEN_DIR/$(printf '%s' "$cwd" | shasum | cut -c1-16)"
-last_seen=$(cat "$marker" 2>/dev/null || echo 0)
+last_seen=$(read_int "$marker")   # a torn marker must not become jq's --argjson
 
 jq -cR 'fromjson? // empty' "$HISTORY_FILE" 2>/dev/null \
   | jq -r --arg cwd "$cwd" --argjson since "$last_seen" \

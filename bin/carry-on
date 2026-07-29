@@ -66,11 +66,19 @@ cmd_cancel() {
   # Last pending gone -> the sleeper notices on its next slice and exits;
   # kill it now if we can, so nothing lingers. Children too (an in-flight
   # resume would otherwise survive the cancel).
+  # Signal the pid only once it is confirmed to BE our sleeper. A pid file
+  # outlives a reboot, pids get recycled, and this path signalled the number
+  # with no check at all — killing an unrelated process of the user's, and
+  # `pkill -P` taking its children with it. The lock still goes: a lock naming
+  # a process that is not ours is stale by definition, and leaving it would
+  # block the next spawn.
   if ! pending_exists && [ -f "$LOCK_DIR/pid" ]; then
     local spid
     spid=$(cat "$LOCK_DIR/pid")
-    pkill -P "$spid" 2>/dev/null || true
-    kill "$spid" 2>/dev/null || true
+    if sleeper_alive "$spid"; then
+      pkill -P "$spid" 2>/dev/null || true
+      kill "$spid" 2>/dev/null || true
+    fi
     rm -rf "$LOCK_DIR"
   fi
 }

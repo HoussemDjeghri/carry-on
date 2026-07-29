@@ -70,6 +70,11 @@ case "$*" in
     # every child after it is handed the drained end and writes nothing, so a
     # truncating redirect erased the evidence before the assertion ever saw it.
     cat >> "$SHIM_STATE/resume-stdin.log" 2>/dev/null
+    # The "resuming" badge marker only exists WHILE the run is in flight, so the
+    # only place it can be observed is from inside the child. Asserting after the
+    # sleeper returns can prove it was cleared, which a marker that was never
+    # written satisfies just as well.
+    ls "$CARRY_ON_HOME/resuming" >> "$SHIM_STATE/resuming-during.log" 2>/dev/null
     echo "resumed-and-continued"; exit "${SHIM_RESUME_EXIT:-0}" ;;
   *) echo "OK" ;;
 esac
@@ -197,6 +202,8 @@ check "pending cleared after resume" test ! -f "$CARRY_ON_HOME/pending/s-cycle.j
 check "chain incremented" bash -c "test \"\$(cat '$CARRY_ON_HOME/chains/s-cycle')\" = 1"
 check "resume stamps window-handover time (chain decay signal)" test -f "$CARRY_ON_HOME/chains/s-cycle.at"
 check "resume flags resumed-reload for the TUI" test -f "$CARRY_ON_HOME/resumed/s-cycle"
+check "resuming marker set DURING the run (badge shows 'resuming…')" \
+  grep -q s-cycle "$SHIM_STATE/resuming-during.log"
 check "resuming marker cleared after the run" test ! -f "$CARRY_ON_HOME/resuming/s-cycle"
 check "resume log captured" bash -c "ls '$CARRY_ON_HOME/logs/' | grep -q s-cycle"
 check "history has resumed event" grep -q '"event":"resumed"' "$CARRY_ON_HOME/history.jsonl"
@@ -509,6 +516,12 @@ jq -cn --argjson t "$(date +%s)" \
 "$ROOT/lib/sleeper.sh"
 check "empty cwd -> resume_failed, never launched" \
   bash -c "! grep -q -- '--resume s-nocwd' '$SHIM_STATE/calls.log' 2>/dev/null && grep -q '\"event\":\"resume_failed\"' '$CARRY_ON_HOME/history.jsonl'"
+# Deleting or renaming a finished worktree is ordinary, and this path drops the
+# queued session for good. Every other terminal path says so; this one counted
+# nothing, so the end-of-pass summary stayed silent and the loss was visible only
+# in the history tail.
+check "a pending whose project directory is gone is reported, not dropped in silence" \
+  grep -q "failed" "$CARRY_ON_NOTIFY_LOG"
 
 fresh_env
 touch "$SHIM_STATE/reset-done"
@@ -747,6 +760,84 @@ check "first session → badge setup offered" bash -c "printf '%s' \"$out\" | gr
 out2=$(printf '{"session_id":"s-first","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh")
 check "setup offer never repeats" bash -c "! printf '%s' \"$out2\" | grep -q 'not set up'"
 
+# ────────── a lock naming a recycled pid is stale, not healthy ──────────
+# The lock dir and its pid file survive a reboot on disk, and the OS recycles
+# pids. Proving the number is ALIVE proves nothing about whose it is: an
+# unrelated process landing on it read as "healthy sleeper", so every recovery
+# entry point returned having done nothing and the pending stranded by the reboot
+# was never resumed, never notified and never expired — expire_stale runs only
+# inside the sleeper that never started.
+echo "# stale lock: pid identity"
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-reboot", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:null,
+    chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-reboot.json"
+sleep 600 & impostor=$!
+mkdir -p "$CARRY_ON_HOME/sleeper.lock"
+echo "$impostor" > "$CARRY_ON_HOME/sleeper.lock/pid"
+echo "$(date +%s)" > "$CARRY_ON_HOME/sleeper.lock/spawned_at"
+printf '{"session_id":"s-rb","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh" >/dev/null
+recovered=false
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ -f "$CARRY_ON_HOME/pending/s-reboot.json" ] || { recovered=true; break; }
+  sleep 1
+done
+check "a lock naming someone else's pid is stolen, not trusted" test "$recovered" = true
+check "the impostor process is never signalled" bash -c "kill -0 $impostor 2>/dev/null"
+kill "$impostor" 2>/dev/null; wait "$impostor" 2>/dev/null
+reap
+
+# `cancel` signalled the pid with no check at all — not even the `kill -0` the
+# spawn path had — and `pkill -P` took its children with it. Reboot, recycled
+# pid, user tidies up: carry-on kills an unrelated process of theirs.
+fresh_env
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs"
+bash -c 'sleep 400 & sleep 400' & victim=$!
+sleep 0.5
+mkdir -p "$CARRY_ON_HOME/sleeper.lock"
+echo "$victim" > "$CARRY_ON_HOME/sleeper.lock/pid"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-cx", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t+900), chain:0, caught_at:$t}' \
+  > "$CARRY_ON_HOME/pending/s-cx.json"
+"$ROOT/bin/carry-on" cancel all >/dev/null 2>&1
+check "cancel never signals a pid it cannot identify as its own sleeper" \
+  bash -c "kill -0 $victim 2>/dev/null"
+check "cancel still clears a lock naming a process that is not ours" \
+  test ! -d "$CARRY_ON_HOME/sleeper.lock"
+kill "$victim" 2>/dev/null; pkill -P "$victim" 2>/dev/null; wait "$victim" 2>/dev/null
+
+# ────────── torn state files are not silently obeyed ──────────
+# `echo N > file` is not atomic; a kill, a reboot or a full disk leaves a
+# zero-length one. The empty string then reaches jq's --argjson, which rejects
+# it, so the `&&` short-circuits and the pending is never written — while the
+# user is told, in the same breath, exactly when their session will resume.
+echo "# torn state files"
+fresh_env
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/chains"
+: > "$CARRY_ON_HOME/chains/s-torn"
+payload s-torn "$TESTDIR/proj" acceptEdits | "$ROOT/hooks/stop-failure.sh" >/dev/null 2>&1
+check "a zero-length chain counter still writes the pending" \
+  test -f "$CARRY_ON_HOME/pending/s-torn.json"
+check "a zero-length chain counter leaves no orphan .tmp in the queue" \
+  bash -c "! ls '$CARRY_ON_HOME/pending'/.*.tmp.* >/dev/null 2>&1"
+reap
+
+# The chain cap is the brake on a runaway resume loop, and it was the one cap
+# without a sanitiser: a non-numeric value made its comparison throw and come
+# back FALSE, so the session kept auto-resuming past the cap. daily_cap got this
+# treatment; max_chain did not.
+fresh_env
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/chains"
+echo 3 > "$CARRY_ON_HOME/chains/s-cap"
+echo "max_chain=three" > "$CARRY_ON_HOME/config"
+payload s-cap "$TESTDIR/proj" acceptEdits | "$ROOT/hooks/stop-failure.sh" >/dev/null 2>&1
+check "a non-numeric max_chain falls back to the default, never to unlimited" \
+  bash -c "[ \"\$(jq -r .notify_only '$CARRY_ON_HOME/pending/s-cap.json')\" = true ]"
+reap
+
 # ────────── the resume child never inherits the pending queue ──────────
 echo "# resume stdin"
 fresh_env
@@ -792,6 +883,54 @@ check "the first spend stamps the spend clock with now" \
 # the wrong file, which is precisely the mutation the suite used to sleep through.
 check "spending does not write a window marker no boundary proved" \
   bash -c "[ ! -s '$CARRY_ON_HOME/daily/window' ]"
+
+# ────────── a boundary is credited exactly once ──────────
+# The cap only means anything if the boundary that refunds it can refund it one
+# time. A retry pending keeps its elapsed reset_epoch by design, so without the
+# credit-once guard that same boundary is re-proved on every probe cycle and the
+# cap is refunded every few minutes for the life of the pending. Every other cap
+# test either has no provable boundary or finishes inside one cycle, so all of
+# them stayed green with the guard deleted.
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+echo "daily_cap=1" > "$CARRY_ON_HOME/config"
+boundary=$(( $(date +%s) - 300 ))
+echo 1 > "$CARRY_ON_HOME/daily/count"
+echo "$boundary" > "$CARRY_ON_HOME/daily/window"          # this boundary is already credited
+echo "$(date +%s)" > "$CARRY_ON_HOME/daily/spend_started"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" --argjson b "$boundary" \
+  '{session_id:"s-once", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:$b,
+    chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-once.json"
+"$ROOT/lib/sleeper.sh"
+check "a boundary already credited does not refund the cap again" \
+  bash -c "! grep -q -- '--resume s-once' '$SHIM_STATE/calls.log' &&
+           grep -q '\"event\":\"daily_capped\"' '$CARRY_ON_HOME/history.jsonl'"
+
+# ────────── crediting a window restarts the spend clock ──────────
+# The stamp half of the spend clock is tested above; this is the clearing half.
+# Left unclear, the clock keeps the oldest spend time forever and the staleness
+# floor fires on a budget spent seconds ago — which is the headline bug the spend
+# clock was introduced to fix, reachable again by deleting one line.
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+boundary=$(( $(date +%s) - 300 ))
+echo 3 > "$CARRY_ON_HOME/daily/count"
+echo $(( $(date +%s) - 9000 )) > "$CARRY_ON_HOME/daily/spend_started"   # an old spend clock
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" --argjson b "$boundary" \
+  '{session_id:"s-clear", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:$b,
+    chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-clear.json"
+"$ROOT/lib/sleeper.sh"
+check "crediting a window clears the counter" \
+  bash -c "[ \"\$(cat '$CARRY_ON_HOME/daily/count' 2>/dev/null)\" = 1 ]"
+# 1, not 0: the credit zeroes it and this pass then spends once.
+check "crediting a window restarts the spend clock, not keeps the old one" \
+  bash -c "s=\$(cat '$CARRY_ON_HOME/daily/spend_started' 2>/dev/null);
+           case \"\$s\" in ''|*[!0-9]*) exit 1 ;; esac
+           [ \$(( \$(date +%s) - s )) -lt 300 ]"
 
 # ────────── a boundary credited long ago is not a stale budget ──────────
 # The staleness floor measures when SPENDING started, never the boundary last

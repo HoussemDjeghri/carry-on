@@ -140,30 +140,12 @@ SPEND_AT_FILE="$DAILY_DIR/spend_started"
 SPEND_TTL=$((5 * 3600 + 3600))  # the 5-hour window plus an hour of slack
 CLOCK_SKEW=300                  # clock noise that is not a jump
 
-# Every number read back from disk is untrusted: these files are documented as
-# user-readable, and a kill or a reboot can leave one truncated mid-write. A
-# non-integer counts as zero rather than making `[` throw "integer expression
-# expected" and take a branch nobody chose — an empty window marker used to
-# disable crediting permanently and silently that way.
-read_int() { # read_int FILE
-  local n
-  n=$(cat "$1" 2>/dev/null || echo 0)
-  case "$n" in "" | *[!0-9]*) n=0 ;; esac
-  printf '%s' "$n"
-}
-
+# `read_int` and the config sanitiser both live in lib/common.sh now: the same
+# torn-file and non-numeric-config hazards reach the chain counter and the chain
+# cap, which are read in the hooks, and a guard that protects only the two files
+# it was written for is not a guard on the class.
 spend_count() { read_int "$SPEND_FILE"; }
-
-# The cap is user config, and config values are strings. A non-numeric one made
-# `[ N -ge twelve ]` throw and the comparison come back FALSE — silently
-# unlimited resumes, the exact opposite of what the key is for. Falling back to
-# the documented default is the only reading that keeps a cap a cap.
-resume_cap() {
-  local n
-  n=$(cfg_daily_cap)
-  case "$n" in "" | *[!0-9]*) n=12 ;; esac
-  printf '%s' "$n"
-}
+resume_cap() { cfg_daily_cap; }
 spend_increment() {
   # Stamp when this budget STARTED accumulating if nothing has yet, so a counter
   # that no credit ever clears is still recognisable as stale rather than
@@ -270,7 +252,14 @@ resume_one() { # resume_one PENDING_FILE
       ;;
   esac
 
+  # Count it as failed, which is what makes the end-of-pass summary fire. Every
+  # other terminal path tells the user something — expired, capped, notify-only,
+  # retries exhausted — but a pending whose project directory was renamed or
+  # deleted was dropped in silence, visible only in the history tail. Deleting a
+  # finished worktree is ordinary; losing the queued session with it should not
+  # be something you have to go looking for.
   if [ -z "$cwd" ] || [ ! -d "$cwd" ]; then
+    failed=$((failed + 1))
     history_append resume_failed "$id" "$cwd"
     rm -f "$f"
     return
