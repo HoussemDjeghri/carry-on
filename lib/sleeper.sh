@@ -35,7 +35,11 @@ finish() {
   fi
   exit 0
 }
-trap 'rm -rf "$LOCK_DIR"' TERM INT
+# EXIT, not merely unlock. Dropping the lock and looping on left a sleeper still
+# serving pendings with its claim released, so ensure_sleeper was free to start a
+# second one beside it. `carry-on cancel` only appeared to kill it because it also
+# removed the pendings, which made the loop self-exit a slice later.
+trap 'rm -rf "$LOCK_DIR"; exit 143' TERM INT
 
 # Newest catch first. When the cap binds it has to bind on the STALEST pending,
 # and glob order spends it on whichever session id sorts first instead — a
@@ -87,7 +91,14 @@ next_wake() {
   known=$(jq -r --argjson n "$now" \
     'select(.reset_epoch != null and .reset_epoch > $n) | .reset_epoch' \
     "$PENDING_DIR"/*.json 2>/dev/null | sort -n | head -1)
-  has_null=$(jq -r 'select(.reset_epoch == null) | "y"' "$PENDING_DIR"/*.json 2>/dev/null | head -1)
+  # A PASSED reset arms the fallback exactly like an unknown one. It can never be
+  # the wake time (above), so if it did not count as unscheduled here it was in
+  # NEITHER set — parked behind any other pending's future reset, which for a
+  # weekly one means days, within reach of expire_stale. That is the retry path's
+  # normal state: a bounded retry re-queues a pending whose reset is now behind us.
+  has_null=$(jq -r --argjson n "$now" \
+    'select(.reset_epoch == null or .reset_epoch <= $n) | "y"' \
+    "$PENDING_DIR"/*.json 2>/dev/null | head -1)
   if [ -n "$has_null" ]; then
     local fb=$((now + $(fallback_step)))
     if [ -n "$known" ] && [ "$known" -lt "$fb" ]; then printf '%s' "$known"; else printf '%s' "$fb"; fi
@@ -118,8 +129,16 @@ probe() {
 # same paid window, making the cap "per window OR per day, whichever comes first".
 SPEND_FILE="$DAILY_DIR/count"
 WINDOW_FILE="$DAILY_DIR/window"
-SPEND_TTL=$((6 * 3600))   # longest window we model, plus slack — see window_credit
-CLOCK_SKEW=300            # clock noise that is not a jump
+# WHEN THIS BUDGET STARTED ACCUMULATING — deliberately not WINDOW_FILE, which
+# holds the credited BOUNDARY. They are different quantities, and sharing one
+# file made the staleness floor measure the wrong one: a boundary credited after
+# the machine slept through the reset is hours old, so the budget was born
+# already stale and the very next sleeper refunded the whole cap. That is the
+# headline scenario — hit the limit overnight, wake to a reset that passed hours
+# ago.
+SPEND_AT_FILE="$DAILY_DIR/spend_started"
+SPEND_TTL=$((5 * 3600 + 3600))  # the 5-hour window plus an hour of slack
+CLOCK_SKEW=300                  # clock noise that is not a jump
 
 # Every number read back from disk is untrusted: these files are documented as
 # user-readable, and a kill or a reboot can leave one truncated mid-write. A
@@ -146,10 +165,10 @@ resume_cap() {
   printf '%s' "$n"
 }
 spend_increment() {
-  # Stamp when this window's accounting STARTED if nothing has yet, so a counter
+  # Stamp when this budget STARTED accumulating if nothing has yet, so a counter
   # that no credit ever clears is still recognisable as stale rather than
   # binding forever. See the staleness floor in window_credit.
-  [ "$(read_int "$WINDOW_FILE")" -gt 0 ] || printf '%s' "$(now_epoch)" > "$WINDOW_FILE"
+  [ "$(read_int "$SPEND_AT_FILE")" -gt 0 ] || printf '%s' "$(now_epoch)" > "$SPEND_AT_FILE"
   echo $(( $(spend_count) + 1 )) > "$SPEND_FILE"
 }
 
@@ -186,16 +205,26 @@ window_credit() { # window_credit [OBSERVED_EPOCH]
   # and DELETED, silently and forever. That state is reachable: a limit message
   # carrying no reset time, plus a fresh sleeper whose first probe succeeds
   # because the small probe model was never limited, leaves neither proof
-  # available. A budget nothing has cleared for longer than the longest window
-  # we model is stale, not spent.
-  if [ -z "$boundary" ] && [ "$seen" -gt 0 ] && [ "$(spend_count)" -gt 0 ] &&
-    [ $((now - seen)) -gt "$SPEND_TTL" ]; then
+  # available. A budget nothing has cleared for longer than a window is stale,
+  # not spent.
+  #
+  # It measures the SPEND stamp, never the credited boundary. Measuring the
+  # boundary asks "how old is the window we last credited", which is hours old by
+  # construction whenever the machine slept through a reset — the budget would be
+  # born stale and refunded within seconds of being spent. Reading the spend stamp
+  # is also why this survives a distrusted marker: zeroing `seen` above no longer
+  # takes the floor's own guard with it.
+  local started
+  started=$(read_int "$SPEND_AT_FILE")
+  if [ -z "$boundary" ] && [ "$started" -gt 0 ] && [ "$(spend_count)" -gt 0 ] &&
+    [ $((now - started)) -gt "$SPEND_TTL" ]; then
     boundary="$now"
   fi
   [ -n "$boundary" ] || return 0
   [ "$boundary" -gt "$seen" ] || return 0
   printf '%s' "$boundary" > "$WINDOW_FILE"
   echo 0 > "$SPEND_FILE"
+  : > "$SPEND_AT_FILE"   # the next spend starts a new accounting clock
 }
 
 resumed=0; failed=0; notified=0
@@ -263,7 +292,13 @@ resume_one() { # resume_one PENDING_FILE
   # Badge signal: this session is resuming RIGHT NOW. The still-open (limit-
   # blocked) TUI shows "resuming…" live; cleared after the run either way.
   : > "$RESUMING_DIR/$id"
-  if (cd "$cwd" && "$CLAUDE" --resume "$id" -p "$prompt" --permission-mode "$pmode") > "$out" 2>&1; then
+  # stdin is CLOSED for the resume. each_pending feeds the loop from a process
+  # substitution, so the rest of the pending queue is this shell's stdin — and
+  # `claude -p` reads piped stdin, so the child consumed the remaining file paths
+  # as user input and ended the pass after one session. The rest then waited for
+  # a fresh billed probe each, and a resume holding bypass permissions was handed
+  # absolute paths it never asked for. The CLI's own warning names this redirect.
+  if (cd "$cwd" && "$CLAUDE" --resume "$id" -p "$prompt" --permission-mode "$pmode") > "$out" 2>&1 < /dev/null; then
     resumed=$((resumed + 1)); history_append resumed "$id" "$cwd"
     chain_increment "$id"; spend_increment
     # The continued transcript is now on disk. Flag the still-open TUI to

@@ -102,7 +102,12 @@ parse_reset_epoch() { # parse_reset_epoch TEXT
 #
 # A reset time is the strongest signal, but plenty of real limit messages carry
 # none ("Run /usage-credits to continue"), so the wording is checked too.
+# The WORDING is the whole test. Accepting "there is a timestamp in here" as
+# proof of a limit put the hole straight back: any failure that happens to carry
+# an ISO-8601 time — a fetch error, a stack trace, a log line — armed the
+# observed-window path, and the next successful probe refunded the entire cap.
+# Nothing is lost by dropping it, because rescheduling reads the reset time
+# separately and unconditionally; only the false arm goes.
 looks_limited() { # looks_limited TEXT
-  [ -n "$(parse_reset_epoch "$1")" ] && return 0
-  printf '%s' "$1" | grep -qiE 'usage limit|rate limit|limit reached|reached your [a-z ]*limit|hit your [a-z ]*limit|usage-credits'
+  printf '%s' "$1" | grep -qiE 'usage limit|rate limit|limit (reached|exceeded)|reached (your|its|the) [a-z -]*limit|hit (your|the) [a-z -]*limit|usage-credits'
 }

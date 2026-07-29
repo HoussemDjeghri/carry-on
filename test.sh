@@ -62,7 +62,12 @@ if [ ! -f "$SHIM_STATE/reset-done" ]; then
   exit 1
 fi
 case "$*" in
-  *"--resume"*) echo "resumed-and-continued"; exit "${SHIM_RESUME_EXIT:-0}" ;;
+  *"--resume"*)
+    # `claude -p` reads piped stdin, so the real binary drains whatever it is
+    # given. Model that, and record it: if the sleeper hands the resume its
+    # pending queue, this file is where the evidence lands.
+    cat > "$SHIM_STATE/resume-stdin.log" 2>/dev/null
+    echo "resumed-and-continued"; exit "${SHIM_RESUME_EXIT:-0}" ;;
   *) echo "OK" ;;
 esac
 SHIM
@@ -449,7 +454,8 @@ touch "$SHIM_STATE/reset-done"
 mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
 echo "daily_cap=1" > "$CARRY_ON_HOME/config"
 echo 1 > "$CARRY_ON_HOME/daily/count"
-echo $(( $(date +%s) - 7 * 3600 )) > "$CARRY_ON_HOME/daily/window"
+# The floor measures when SPENDING started, not the boundary last credited.
+echo $(( $(date +%s) - 7 * 3600 )) > "$CARRY_ON_HOME/daily/spend_started"
 jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
   '{session_id:"s-stale", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:null, chain:0, caught_at:$t, retries:0, notify_only:false}' \
   > "$CARRY_ON_HOME/pending/s-stale.json"
@@ -737,6 +743,92 @@ out=$(printf '{"session_id":"s-first","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hook
 check "first session → badge setup offered" bash -c "printf '%s' \"$out\" | grep -q 'not set up'"
 out2=$(printf '{"session_id":"s-first","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh")
 check "setup offer never repeats" bash -c "! printf '%s' \"$out2\" | grep -q 'not set up'"
+
+# ────────── the resume child never inherits the pending queue ──────────
+echo "# resume stdin"
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+for s in s-q1 s-q2 s-q3; do
+  jq -cn --arg id "$s" --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+    '{session_id:$id, cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:null, chain:0, caught_at:$t, retries:0, notify_only:false}' \
+    > "$CARRY_ON_HOME/pending/$s.json"
+done
+"$ROOT/lib/sleeper.sh"
+check "every queued pending is resumed in one pass, not one per cycle" \
+  bash -c "[ \"\$(grep -c -- '--resume' '$SHIM_STATE/calls.log')\" = 3 ]"
+check "the resume child is handed no stdin (the queue is not its input)" \
+  bash -c "[ ! -s '$SHIM_STATE/resume-stdin.log' ]"
+
+# ────────── a boundary credited long ago is not a stale budget ──────────
+# The staleness floor measures when SPENDING started, never the boundary last
+# credited: sleeping through a reset credits an hours-old boundary, and reading
+# that as the budget's age refunds the whole cap seconds after it was spent.
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+echo "daily_cap=1" > "$CARRY_ON_HOME/config"
+echo 1 > "$CARRY_ON_HOME/daily/count"
+echo $(( $(date +%s) - 10 * 3600 )) > "$CARRY_ON_HOME/daily/window"       # credited 10h ago
+echo "$(date +%s)" > "$CARRY_ON_HOME/daily/spend_started"                  # but spent just now
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-fresh", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:null, chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-fresh.json"
+"$ROOT/lib/sleeper.sh"
+check "an old credited boundary does not make a fresh budget stale" \
+  bash -c "! grep -q -- '--resume s-fresh' '$SHIM_STATE/calls.log'"
+
+# ────────── a distrusted marker must not disable the floor ──────────
+# Distrusting a future marker and the staleness floor were added together and
+# used to cancel: zeroing the marker killed the guard the floor stood on, so the
+# case the floor exists for bound again for as long as the clock stayed ahead.
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+echo "daily_cap=1" > "$CARRY_ON_HOME/config"
+echo 1 > "$CARRY_ON_HOME/daily/count"
+echo $(( $(date +%s) + 3600 )) > "$CARRY_ON_HOME/daily/window"             # impossible marker
+echo $(( $(date +%s) - 7 * 3600 )) > "$CARRY_ON_HOME/daily/spend_started"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-skew", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:null, chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-skew.json"
+"$ROOT/lib/sleeper.sh"
+check "a distrusted future marker does not disable the staleness floor" \
+  bash -c "grep -q -- '--resume s-skew' '$SHIM_STATE/calls.log'"
+
+# ────────── a passed reset arms the fallback, like an unknown one ──────────
+# It can never be the wake time, so if it is not counted as unscheduled it is in
+# neither set and parks behind any future reset — days, for a weekly one.
+fresh_env
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+printf 'probe_backoff=3\n' > "$CARRY_ON_HOME/config"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" --argjson r "$(( $(date +%s) + 600 ))" \
+  '{session_id:"s-far", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:$r, chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-far.json"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" --argjson r "$(( $(date +%s) - 100 ))" \
+  '{session_id:"s-past", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:$r, chain:0, caught_at:$t, retries:1, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-past.json"
+"$ROOT/lib/sleeper.sh" & sleeper_pid=$!
+sleep 8
+check "a passed reset is not starved by a far-future one (fallback fired)" \
+  bash -c "[ -s '$SHIM_STATE/calls.log' ]"
+
+# ────────── SIGTERM ends the sleeper, it does not merely unlock it ──────────
+# Dropping the lock and looping on left a sleeper serving pendings with its
+# claim released, so a second one could start beside it.
+kill -TERM "$sleeper_pid" 2>/dev/null
+sleep 2
+check "SIGTERM exits the sleeper rather than only releasing its lock" \
+  bash -c "! kill -0 $sleeper_pid 2>/dev/null"
+wait "$sleeper_pid" 2>/dev/null
+
+# ────────── looks_limited answers 'is this a limit', not 'is there a time' ──────────
+( . "$ROOT/lib/parse-reset.sh"
+  looks_limited "fetch failed at 2026-07-29T10:00:00.000Z" ) && ll_time=yes || ll_time=no
+check "a failure that merely carries a timestamp is not a limit" test "$ll_time" = no
+( . "$ROOT/lib/parse-reset.sh"
+  looks_limited "You've reached your model limit. Run /usage-credits to continue." ) && ll_real=yes || ll_real=no
+check "a real limit message with no reset time still reads as a limit" test "$ll_real" = yes
 
 # ───────────────────────── notify: no desktop popup ─────────────────────────
 echo "# notify"
