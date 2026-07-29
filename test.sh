@@ -518,20 +518,39 @@ CARRY_ON_FALLBACK_STEPS="5 5 5" \
 jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
   '{session_id:"s-backoff", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t-100), chain:0, caught_at:$t, retries:0, notify_only:false}' \
   > "$CARRY_ON_HOME/pending/s-backoff.json"
-backoff_t0=$SECONDS
 ( CARRY_ON_FALLBACK_STEPS="5 5 5"; export CARRY_ON_FALLBACK_STEPS; "$ROOT/lib/sleeper.sh" ) &
 sleeper_pid=$!
+# Time the window from the FIRST probe, never from the spawn. The schedule's
+# first step is 5s and a "1s" slice costs SLICE plus two jq runs, so the first
+# probe lands past 6s about half the time — and a fixed `sleep 6` that expires
+# first leaves no calls.log at all, which reads as "very few probes" and passes
+# the collapse check without the back-off code having run once.
+backoff_first=false
+for _ in $(seq 60); do
+  [ -s "$SHIM_STATE/calls.log" ] && { backoff_first=true; break; }
+  sleep 0.5
+done
+probe_t0=$SECONDS
 sleep 6
+# The subshell FORKS the sleeper, so $sleeper_pid is only the wrapper: killing
+# it leaves the real one probing, and those probes land after the window closed
+# but are still counted inside it. The sleeper names itself in the lock.
+backoff_sleeper=$(cat "$CARRY_ON_HOME/sleeper.lock/pid" 2>/dev/null || true)
 kill "$sleeper_pid" 2>/dev/null; wait "$sleeper_pid" 2>/dev/null
-backoff_elapsed=$((SECONDS - backoff_t0))
+[ -n "$backoff_sleeper" ] && kill "$backoff_sleeper" 2>/dev/null
+for _ in $(seq 25); do
+  [ -n "$backoff_sleeper" ] && kill -0 "$backoff_sleeper" 2>/dev/null || break
+  sleep 0.2
+done
+backoff_elapsed=$((SECONDS - probe_t0))
+backoff_probes=$(grep -c -- '-p Reply' "$SHIM_STATE/calls.log" 2>/dev/null || true)
 reap
-# The bar scales with the time the sleeper actually got, because a fixed count
-# over a `sleep 6` that overruns under load counts probes the schedule was
-# entitled to make. With SLICE=1 and 5s steps, correct behaviour is ~1 probe per
-# 5s and the collapse is ~1 per second, so half the elapsed seconds separates
-# them at any duration.
+# Both halves: the schedule ran at all, and it did not collapse. With SLICE=1
+# and 5s steps correct behaviour is ~1 probe per 5s while the collapse probes
+# with no sleep between, so half the elapsed seconds separates them.
+check "the back-off schedule reaches its first probe" test "$backoff_first" = true
 check "a past reset does not collapse the probe back-off to one slice" \
-  bash -c "[ \"\$(grep -c -- '-p Reply' '$SHIM_STATE/calls.log')\" -le $(( backoff_elapsed / 2 + 1 )) ]"
+  test "${backoff_probes:-0}" -le $(( backoff_elapsed / 2 + 1 ))
 
 fresh_env
 touch "$SHIM_STATE/reset-done"
