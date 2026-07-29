@@ -18,8 +18,12 @@ cleanup() {
   for d in "${TESTDIRS[@]:-}"; do
     [ -n "$d" ] || continue
     pid=$(cat "$d/state/sleeper.lock/pid" 2>/dev/null || true)
-    if [ -n "$pid" ]; then pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null; fi
+    # Remove the state FIRST. The pid file names only the newest sleeper for this
+    # dir, so any earlier one — a run whose lock was stolen — is missed by the
+    # kill below and would keep sleeping. With its pending queue gone it exits on
+    # its own within one slice instead, which bounds the leak whatever we miss.
     rm -rf "$d"
+    if [ -n "$pid" ]; then pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null; fi
   done
 }
 trap cleanup EXIT
@@ -785,6 +789,37 @@ out=$(printf '{"session_id":"s-first","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hook
 check "first session → badge setup offered" bash -c "printf '%s' \"$out\" | grep -q 'not set up'"
 out2=$(printf '{"session_id":"s-first","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh")
 check "setup offer never repeats" bash -c "! printf '%s' \"$out2\" | grep -q 'not set up'"
+
+# ────────── a session that comes back on its own retires its pending ──────────
+# Only carry-on resuming a session used to retire its pending, so a session the
+# user brought back by hand kept one forever: the badge read "waiting for reset"
+# for the life of the session, and the sleeper still had it QUEUED — at the next
+# reset it would launch a headless resume of a session being actively typed in.
+echo "# a live session is not still waiting"
+fresh_env
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/resuming"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-back", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t+900), chain:0, caught_at:$t}' \
+  > "$CARRY_ON_HOME/pending/s-back.json"
+printf '{"session_id":"s-back","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh" >/dev/null
+check "a session that starts again is no longer waiting for a reset" \
+  test ! -f "$CARRY_ON_HOME/pending/s-back.json"
+check "coming back by hand is recorded" \
+  grep -q '"event":"reattached"' "$CARRY_ON_HOME/history.jsonl"
+reap
+
+# ...but NOT when the SessionStart is carry-on's own headless resume: that child
+# fires this hook too, and its pending is the record the sleeper needs to retry.
+fresh_env
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/resuming"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-mid", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t+900), chain:0, caught_at:$t}' \
+  > "$CARRY_ON_HOME/pending/s-mid.json"
+: > "$CARRY_ON_HOME/resuming/s-mid"
+printf '{"session_id":"s-mid","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh" >/dev/null
+check "our own resume does not delete the pending it may need to retry" \
+  test -f "$CARRY_ON_HOME/pending/s-mid.json"
+reap
 
 # ────────── a headless resume that hits the limit is not lost ──────────
 # The resume child runs the user's hooks, so a child killed by a FRESH usage

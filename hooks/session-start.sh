@@ -66,6 +66,27 @@ if [ "$(cfg_enabled)" = "true" ]; then
   fi
 fi
 
+# A session that is STARTING is, by definition, no longer waiting on a reset.
+#
+# Nothing used to retire a pending except carry-on resuming it itself, so a
+# session the user brought back by hand — reattaching once the window lifted, or
+# just continuing where the limit had stopped it — left its pending behind. The
+# badge then read "waiting for reset" for as long as the session lived, which is
+# the visible half. The expensive half is that the sleeper still had it queued:
+# at the next reset it would launch a headless resume of a session the user is
+# actively typing in, billed, with two writers on one transcript. Failing that it
+# sat until max_wait (7 days) and expired with a notification about a session that
+# came back a week earlier.
+#
+# NOT when we are the resume: `resuming/<id>` exists exactly for the span of our
+# own headless run, whose child fires this hook too. Clearing there would delete
+# the record the sleeper needs to retry a resume that fails.
+if [ -n "$session_id" ] && [ ! -f "$RESUMING_DIR/$session_id" ] &&
+  [ -f "$PENDING_DIR/$session_id.json" ]; then
+  rm -f "$PENDING_DIR/$session_id.json"
+  history_append reattached "$session_id" "$cwd"
+fi
+
 # Reboot/crash recovery: a pending with no live sleeper gets one now.
 ensure_sleeper "$ROOT"
 
