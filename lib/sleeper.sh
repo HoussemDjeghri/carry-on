@@ -218,9 +218,9 @@ resume_one() { # resume_one PENDING_FILE
   cwd=$(jq -r '.cwd // empty' "$f")
   pmode=$(jq -r '.permission_mode // "default"' "$f")
   retries=$(jq -r '.retries // 0' "$f")
-# Remembered so the failure branch can tell "our run failed" from "the child was
-# caught by a fresh limit and re-queued while we ran". See there.
-caught_before=$(jq -r '.caught_at // 0' "$f" 2>/dev/null || echo 0)
+  # Remembered so the failure branch can tell "our run failed" from "the child
+  # was caught by a fresh limit and re-queued while we ran". See there.
+  caught_before=$(jq -r '.caught_at // 0' "$f" 2>/dev/null || echo 0)
   notify_only=$(jq -r '.notify_only // false' "$f")
   prompt=$(cfg_resume_prompt)
 
@@ -284,6 +284,13 @@ caught_before=$(jq -r '.caught_at // 0' "$f" 2>/dev/null || echo 0)
   # Badge signal: this session is resuming RIGHT NOW. The still-open (limit-
   # blocked) TUI shows "resuming…" live; cleared after the run either way.
   : > "$RESUMING_DIR/$id"
+  # The pending file IS the claim on this session, and SessionStart deletes it
+  # the moment the user brings the session back by hand. The queue snapshot is
+  # rechecked before this callback runs, but the reads above still sit between
+  # that check and the launch. Recheck after the marker exists, so the two
+  # sides cannot both decide they own the session: whoever acts second sees the
+  # other's flag. Resuming here would type into a session being used.
+  if [ ! -f "$f" ]; then rm -f "$RESUMING_DIR/$id"; return; fi
   # stdin is CLOSED for the resume. each_pending feeds the loop from a process
   # substitution, so the rest of the pending queue is this shell's stdin — and
   # `claude -p` reads piped stdin, so the child consumed the remaining file paths
