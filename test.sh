@@ -874,7 +874,13 @@ jq -cn --arg cwd "$TESTDIR/proj" --argjson t $(( $(date +%s) - 60 )) \
   > "$CARRY_ON_HOME/pending/s-again.json"
 "$ROOT/lib/sleeper.sh" &
 sleeper_pid=$!
-sleep 6
+# Wait for the re-queue to be RECORDED, never a guessed sleep. The first two
+# checks look for a pending file the FIXTURE already wrote, so a sleeper that
+# never reached its probe satisfies them without the code having run.
+for _ in $(seq 60); do
+  grep -q '"event":"resume_requeued"' "$CARRY_ON_HOME/history.jsonl" 2>/dev/null && break
+  sleep 0.5
+done
 kill "$sleeper_pid" 2>/dev/null; wait "$sleeper_pid" 2>/dev/null
 reap
 check "a resume re-caught by a fresh limit keeps its new pending" \
@@ -1107,7 +1113,9 @@ jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" --argjson r "$(( $(da
   '{session_id:"s-past", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:$r, chain:0, caught_at:$t, retries:1, notify_only:false}' \
   > "$CARRY_ON_HOME/pending/s-past.json"
 "$ROOT/lib/sleeper.sh" & sleeper_pid=$!
-sleep 8
+# The starved case never probes at all, so waiting for the probe IS the
+# assertion — bounded, rather than a fixed sleep the machine can outrun.
+for _ in $(seq 60); do [ -s "$SHIM_STATE/calls.log" ] && break; sleep 0.5; done
 check "a passed reset is not starved by a far-future one (fallback fired)" \
   bash -c "[ -s '$SHIM_STATE/calls.log' ]"
 
@@ -1115,7 +1123,7 @@ check "a passed reset is not starved by a far-future one (fallback fired)" \
 # Dropping the lock and looping on left a sleeper serving pendings with its
 # claim released, so a second one could start beside it.
 kill -TERM "$sleeper_pid" 2>/dev/null
-sleep 2
+for _ in $(seq 40); do kill -0 "$sleeper_pid" 2>/dev/null || break; sleep 0.25; done
 check "SIGTERM exits the sleeper rather than only releasing its lock" \
   bash -c "! kill -0 $sleeper_pid 2>/dev/null"
 wait "$sleeper_pid" 2>/dev/null
