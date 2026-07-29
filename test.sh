@@ -760,6 +760,52 @@ check "first session → badge setup offered" bash -c "printf '%s' \"$out\" | gr
 out2=$(printf '{"session_id":"s-first","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh")
 check "setup offer never repeats" bash -c "! printf '%s' \"$out2\" | grep -q 'not set up'"
 
+# ────────── a headless resume that hits the limit is not lost ──────────
+# The resume child runs the user's hooks, so a child killed by a FRESH usage
+# limit re-queues its own session through the catcher while the sleeper is still
+# waiting on it. The sleeper's `retries` was read before the run and describes a
+# pending that no longer exists; acting on it deleted the fresh catch, losing the
+# only record that the session is waiting on the next reset. Long chains reach
+# this on the ordinary path — running until the window closes again is the point.
+echo "# headless resume re-caught by a fresh limit"
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+# The shim stands in for a resume that dies on a new limit: it re-queues the
+# session exactly as the catcher would, with a fresh caught_at, then exits 1.
+cat > "$TESTDIR/bin/claude" <<SHIM
+#!/bin/bash
+printf '%s\n' "\$*" >> "\$SHIM_STATE/calls.log"
+case "\$*" in
+  *"--resume"*)
+    jq -cn --arg cwd "$TESTDIR/proj" --argjson t "\$(date +%s)" --argjson r \$(( \$(date +%s) + 1800 )) \\
+      '{session_id:"s-again", cwd:\$cwd, permission_mode:"acceptEdits", reset_epoch:\$r,
+        chain:1, caught_at:\$t, retries:0, notify_only:false}' \\
+      > "$CARRY_ON_HOME/pending/s-again.json"
+    echo "You've hit your usage limit"; exit 1 ;;
+  *) echo "OK" ;;
+esac
+SHIM
+chmod +x "$TESTDIR/bin/claude"
+# retries already spent: the old code would delete the fresh catch outright.
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t $(( $(date +%s) - 60 )) \
+  '{session_id:"s-again", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:null,
+    chain:1, caught_at:$t, retries:1, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-again.json"
+"$ROOT/lib/sleeper.sh" &
+sleeper_pid=$!
+sleep 6
+kill "$sleeper_pid" 2>/dev/null; wait "$sleeper_pid" 2>/dev/null
+reap
+check "a resume re-caught by a fresh limit keeps its new pending" \
+  test -f "$CARRY_ON_HOME/pending/s-again.json"
+check "the re-queued pending keeps the NEW window's reset, not our stale retry count" \
+  bash -c "[ \"\$(jq -r .retries '$CARRY_ON_HOME/pending/s-again.json')\" = 0 ] &&
+           [ \"\$(jq -r .reset_epoch '$CARRY_ON_HOME/pending/s-again.json')\" != null ]"
+check "the re-queue is recorded, not counted as a failure" \
+  bash -c "grep -q '\"event\":\"resume_requeued\"' '$CARRY_ON_HOME/history.jsonl' &&
+           ! grep -q '\"event\":\"resume_failed\"' '$CARRY_ON_HOME/history.jsonl'"
+
 # ────────── a lock naming a recycled pid is stale, not healthy ──────────
 # The lock dir and its pid file survive a reboot on disk, and the OS recycles
 # pids. Proving the number is ALIVE proves nothing about whose it is: an

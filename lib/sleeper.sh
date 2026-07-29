@@ -212,12 +212,15 @@ window_credit() { # window_credit [OBSERVED_EPOCH]
 resumed=0; failed=0; notified=0
 
 resume_one() { # resume_one PENDING_FILE
-  local f="$1" id cwd pmode prompt out ts retries notify_only
+  local f="$1" id cwd pmode prompt out ts retries notify_only caught_before caught_now
   id=$(jq -r '.session_id // empty' "$f" 2>/dev/null)
   [ -n "$id" ] || { rm -f "$f"; return; }
   cwd=$(jq -r '.cwd // empty' "$f")
   pmode=$(jq -r '.permission_mode // "default"' "$f")
   retries=$(jq -r '.retries // 0' "$f")
+# Remembered so the failure branch can tell "our run failed" from "the child was
+# caught by a fresh limit and re-queued while we ran". See there.
+caught_before=$(jq -r '.caught_at // 0' "$f" 2>/dev/null || echo 0)
   notify_only=$(jq -r '.notify_only // false' "$f")
   prompt=$(cfg_resume_prompt)
 
@@ -298,7 +301,24 @@ resume_one() { # resume_one PENDING_FILE
     # Transient failures (crash, network, a per-model bucket the probe's
     # small model doesn't share) get one bounded retry on the fallback
     # schedule before the pending is declared lost.
-    if [ "$retries" -lt 1 ]; then
+    # A headless resume runs the user's hooks, so a child that died on a FRESH
+    # usage limit has ALREADY re-queued this session through the catcher — with
+    # the new window's reset time and a retry budget of its own. Our `retries`
+    # was read before the run and describes a pending that no longer exists.
+    # Acting on it bumps the new catch's counter, and once that budget looks
+    # spent it DELETES the fresh pending outright: the headless run is gone, the
+    # only record that the session is waiting on a reset is gone with it, and the
+    # badge drops back to plain armed with nothing queued. The session's progress
+    # is on disk in its transcript, but nothing will ever go back for it.
+    #
+    # This is the ordinary path for a long chain, not a corner: the whole point
+    # of a resume is to run until the window closes again.
+    caught_now=$(jq -r '.caught_at // 0' "$f" 2>/dev/null || echo 0)
+    if [ ! -f "$f" ]; then
+      : # cancelled mid-run; nothing of ours left to settle
+    elif [ "$caught_now" != "$caught_before" ]; then
+      history_append resume_requeued "$id" "$cwd"
+    elif [ "$retries" -lt 1 ]; then
       # Keep reset_epoch. It is this pending's only record of which window it
       # belongs to, and a retry that erases it can never have the cap credited
       # on its behalf — it gets capped and DELETED on the retry pass, so the
