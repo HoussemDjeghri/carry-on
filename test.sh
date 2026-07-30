@@ -71,6 +71,18 @@ if [ ! -f "$SHIM_STATE/reset-done" ]; then
 fi
 case "$*" in
   *"--resume"*)
+    # The real CLI's verbatim refusal for a session it is already running itself.
+    if [ -f "$SHIM_STATE/bg-agent" ]; then
+      echo "Error: Session x is currently running as a background agent (bg). Use \`claude agents\` to find and attach to it, or add --fork-session to branch off a copy."
+      exit 1
+    fi
+    # A run that FAILED for an ordinary reason, whose transcript happens to talk
+    # about background agents. This log is the resumed session's own output, so
+    # that is not a hypothetical shape.
+    if [ -f "$SHIM_STATE/bg-prose" ]; then
+      echo "I checked whether this session is currently running as a background agent; it is not."
+      exit 1
+    fi
     # `claude -p` reads piped stdin, so the real binary drains whatever it is
     # given. Model that, and record it: if the sleeper hands the resume its
     # pending queue, this file is where the evidence lands.
@@ -220,6 +232,20 @@ check "resume used recorded permission mode" grep -q -- "--permission-mode accep
 check "pending cleared after resume" test ! -f "$CARRY_ON_HOME/pending/s-cycle.json"
 check "chain incremented" bash -c "test \"\$(cat '$CARRY_ON_HOME/chains/s-cycle')\" = 1"
 check "resume stamps window-handover time (chain decay signal)" test -f "$CARRY_ON_HOME/chains/s-cycle.at"
+# The stamp's VALUE, not just its existence. Chain decay's consumer is well
+# covered, but its producer was asserted only with `test -f`, and the three decay
+# tests write this file themselves — so the stamp could be a placeholder with the
+# suite fully green. The catcher's decay guard is `-gt 0`, so a zero means decay
+# never fires and a long unattended run degrades to notify-only after max_chain
+# resumes even when every window ran a healthy course.
+check "the stamp is a live epoch, not a placeholder" \
+  bash -c "at=\$(cat '$CARRY_ON_HOME/chains/s-cycle.at'); now=\$(date +%s); test \"\$at\" -gt \$((now - 600)) && test \"\$at\" -le \$((now + 5))"
+# The reporter's per-project "was resumed" line is read from these two fields,
+# and every test of it appends its OWN history lines — so the writer was never
+# asserted. Emptying `cwd` or zeroing `ts` in `history_append` left the suite at
+# 140/0 while the report could no longer fire for any real resume.
+check "the resumed line the product wrote carries this cwd and a live ts" \
+  bash -c "now=\$(date +%s); jq -rs --arg cwd '$TESTDIR/proj' --argjson now \"\$now\" '[.[]|select(.event==\"resumed\")]|last|((.cwd==\$cwd) and (.ts>(\$now-600)) and (.ts<=(\$now+5)))' '$CARRY_ON_HOME/history.jsonl' | grep -qx true"
 check "resume flags resumed-reload for the TUI" test -f "$CARRY_ON_HOME/resumed/s-cycle"
 check "resuming marker set DURING the run (badge shows 'resuming…')" \
   grep -q s-cycle "$SHIM_STATE/resuming-during.log"
@@ -262,6 +288,21 @@ jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
 check "notify mode: no resume call" bash -c "! grep -q -- '--resume s-notify' '$SHIM_STATE/calls.log'"
 check "notify mode: reset notification sent" grep -qi "reset" "$CARRY_ON_NOTIFY_LOG"
 check "notify mode: pending cleared" test ! -f "$CARRY_ON_HOME/pending/s-notify.json"
+
+# The chain cap's READER. Three tests assert the catcher WRITES notify_only, and
+# nothing handed a `notify_only: true` pending to the sleeper — every sleeper
+# fixture in the suite sets it false or omits it. So the flag's only consumer was
+# dead to the suite: delete the guard and a runaway session is resumed past
+# max_chain forever, which is the loop the cap exists to brake.
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-capped-flag", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t-1), chain:3, caught_at:$t, retries:0, notify_only:true}' \
+  > "$CARRY_ON_HOME/pending/s-capped-flag.json"
+"$ROOT/lib/sleeper.sh"
+check "a notify_only pending is notified, never resumed" \
+  bash -c "! grep -q -- '--resume s-capped-flag' '$SHIM_STATE/calls.log' 2>/dev/null && grep -q '\"event\":\"reset_notified\"' '$CARRY_ON_HOME/history.jsonl'"
 
 echo "# sleeper: expiry past max_wait"
 fresh_env
@@ -340,6 +381,41 @@ check "failed resume retried once then declared failed" \
   bash -c "grep -q '\"event\":\"resume_retry\"' '$CARRY_ON_HOME/history.jsonl' && grep -q '\"event\":\"resume_failed\"' '$CARRY_ON_HOME/history.jsonl' && test ! -f '$CARRY_ON_HOME/pending/s-retry.json'"
 check "retry made exactly two resume attempts" \
   bash -c "test \"\$(grep -c -- '--resume s-retry' '$SHIM_STATE/calls.log')\" = 2"
+
+# Same non-zero exit as the retry case above, one word different in the log, and
+# the correct answer is the opposite: retire immediately. Observed live — two
+# resets in a row spent ~15 min of retry schedule each on a session the CLI was
+# never going to hand over.
+fresh_env
+touch "$SHIM_STATE/reset-done" "$SHIM_STATE/bg-agent"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-bgagent", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t-1), chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-bgagent.json"
+"$ROOT/lib/sleeper.sh"
+rm -f "$SHIM_STATE/bg-agent"
+check "a session the CLI runs as a background agent is retired at once, never retried" \
+  bash -c "grep -q '\"event\":\"resume_unattachable\"' '$CARRY_ON_HOME/history.jsonl' && ! grep -q '\"event\":\"resume_retry\"' '$CARRY_ON_HOME/history.jsonl' && test ! -f '$CARRY_ON_HOME/pending/s-bgagent.json'"
+# The retire must follow an attempt that was actually made: "no retry" alone is
+# equally satisfied by a pass that never launched anything.
+check "the unattachable session was attempted exactly once" \
+  bash -c "test \"\$(grep -c -- '--resume s-bgagent' '$SHIM_STATE/calls.log')\" = 1"
+
+# The other side of that match. The log being read is the resumed session's own
+# output, so "the CLI refused" and "the session talked about the CLI refusing"
+# have to stay distinguishable, or an ordinary failure loses its retry.
+fresh_env
+touch "$SHIM_STATE/reset-done" "$SHIM_STATE/bg-prose"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-bgprose", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t-1), chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-bgprose.json"
+"$ROOT/lib/sleeper.sh"
+rm -f "$SHIM_STATE/bg-prose"
+check "a failure that merely MENTIONS background agents keeps its retry" \
+  bash -c "grep -q '\"event\":\"resume_retry\"' '$CARRY_ON_HOME/history.jsonl' && ! grep -q '\"event\":\"resume_unattachable\"' '$CARRY_ON_HOME/history.jsonl'"
+check "it was attempted twice, like any other failed resume" \
+  bash -c "test \"\$(grep -c -- '--resume s-bgprose' '$SHIM_STATE/calls.log')\" = 2"
 
 fresh_env
 touch "$SHIM_STATE/reset-done"
@@ -568,6 +644,20 @@ check "empty cwd -> resume_failed, never launched" \
 check "a pending whose project directory is gone is reported, not dropped in silence" \
   grep -q "failed" "$CARRY_ON_NOTIFY_LOG"
 
+# Both fixtures above use an EMPTY cwd, which the `-z` half catches, so the
+# missing-directory half — the case the test above is named for — never ran.
+# Deleting it costs a second billed probe cycle and records `resume_retry`, which
+# misdescribes a directory that is simply gone.
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs"
+jq -cn --arg cwd "$TESTDIR/gone-for-good" --argjson t "$(date +%s)" \
+  '{session_id:"s-gonedir", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t-1), chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-gonedir.json"
+"$ROOT/lib/sleeper.sh"
+check "a cwd that no longer exists -> resume_failed on the first pass, never launched" \
+  bash -c "! grep -q -- '--resume s-gonedir' '$SHIM_STATE/calls.log' 2>/dev/null && grep -q '\"event\":\"resume_failed\"' '$CARRY_ON_HOME/history.jsonl' && ! grep -q '\"event\":\"resume_retry\"' '$CARRY_ON_HOME/history.jsonl'"
+
 fresh_env
 touch "$SHIM_STATE/reset-done"
 mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
@@ -701,6 +791,14 @@ rm -f "$CARRY_ON_HOME/config"
 # A hostile session id can neither traverse paths nor reach the terminal.
 out=$(printf '{"session_id":"../../etc/passwd"}' | "$ROOT/hooks/statusline.sh")
 check "path-traversal session id yields no badge" test -z "$out"
+# …and that assertion passed for the wrong reason: `../../etc/passwd` resolves to
+# nothing under the test state dir, so an EMPTY badge proves only that the file was
+# missing. Aim the traversal at a marker that really exists, and the charset guard
+# is the only thing left standing between a hostile id and a badge rendered in a
+# session carry-on was never armed for.
+mkdir -p "$CARRY_ON_HOME/sessions"; : > "$CARRY_ON_HOME/sessions/s-line"
+out=$(printf '{"session_id":"../sessions/s-line"}' | "$ROOT/hooks/statusline.sh")
+check "a traversal resolving to a REAL marker still yields no badge" test -z "$out"
 
 # ───────────── statusline: drop-in dispatcher, wiring, self-heal ─────────────
 echo "# statusline drop-in"
@@ -745,6 +843,32 @@ check "wired: a composer script that chains the badge" wired
 fresh_env
 rm -f "$CLAUDE_CONFIG_DIR/settings.json"
 check "not wired: no settings.json" notwired
+
+# The two fast paths, which twelve wiring tests never reached: every fixture
+# above resolves through the one-level-down loop, because its statusLine command
+# names a dispatcher script and neither the badge nor the drop-in dir appears in
+# the command STRING. Inverting both `case` arms left the suite at 140/0 — and
+# these are the two configurations the badge's own header documents.
+fresh_env
+printf '#!/bin/bash\necho badge\n' > "$CLAUDE_CONFIG_DIR/hooks/carry-on-statusline.sh"
+jq -n --arg c "bash \"$CLAUDE_CONFIG_DIR/hooks/carry-on-statusline.sh\"" \
+  '{statusLine:{type:"command",command:$c}}' > "$CLAUDE_CONFIG_DIR/settings.json"
+check "wired: the statusLine command names the badge directly" wired
+
+fresh_env
+mkdir -p "$CLAUDE_CONFIG_DIR/statusline.d"
+: > "$CLAUDE_CONFIG_DIR/statusline.d/60-carry-on.sh"
+jq -n --arg c 'for f in "$CLAUDE_CONFIG_DIR"/statusline.d/*.sh; do bash "$f"; done' \
+  '{statusLine:{type:"command",command:$c}}' > "$CLAUDE_CONFIG_DIR/settings.json"
+check "wired: an inline drop-in loop with our fragment present" wired
+rm -f "$CLAUDE_CONFIG_DIR/statusline.d/60-carry-on.sh"
+check "not wired: an inline drop-in loop with our fragment missing" notwired
+
+# A settings command may store the path unexpanded, and nothing tested that the
+# expansion happens — so a wired badge could be read as un-wired and the user
+# nagged to re-wire what already works.
+check "a settings path stored as \$HOME is expanded before it is tested" \
+  bash -c ". \"$ROOT/lib/common.sh\"; test \"\$(_expand_config_path '\"\$HOME/.claude/hooks/x.sh\"')\" = \"\$HOME/.claude/hooks/x.sh\""
 
 echo "# statusline wiring (carry-on statusline)"
 # No statusline yet → install the dispatcher, point settings at it, drop the

@@ -325,6 +325,24 @@ resume_one() { # resume_one PENDING_FILE
       : # cancelled mid-run; nothing of ours left to settle
     elif [ "$caught_now" != "$caught_before" ]; then
       history_append resume_requeued "$id" "$cwd"
+    elif grep -qE '^Error: Session .* is currently running as a background agent' "$out" 2>/dev/null; then
+      # A session the CLI is running as a background agent refuses `--resume`
+      # outright: it is already attached to a live process. That is a permanent
+      # answer, not a transient one, so the retry ladder below just spends the
+      # fallback schedule — a quarter of an hour of waiting — to be told the same
+      # thing twice. The CLI suggests --fork-session; we deliberately do not,
+      # because a fork is a COPY: the resume would succeed into a transcript the
+      # user is not looking at, and the session they are waiting on would sit
+      # untouched while carry-on reported it resumed. Retire the claim and say
+      # why; the session itself is intact and reachable with `claude agents`.
+      #
+      # Matched on the CLI's error LINE, not on the phrase. This log holds the
+      # resumed session's own output, and a session can discuss background agents
+      # — a bare phrase match would retire a pending that deserved its retry.
+      notified=$((notified + 1))
+      history_append resume_unattachable "$id" "$cwd"
+      notify "carry-on: session ${id:0:8} runs as a background agent — cannot be resumed; attach it with 'claude agents'"
+      rm -f "$f"
     elif [ "$retries" -lt 1 ]; then
       # Keep reset_epoch. It is this pending's only record of which window it
       # belongs to, and a retry that erases it can never have the cap credited
