@@ -1,6 +1,6 @@
 {
   "name": "carry-on",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "Auto-resume Claude Code sessions after a usage-limit reset: hook-native detection, no daemon, no polling, no keystroke injection.",
   "author": {
     "name": "Houssem Djeghri"
