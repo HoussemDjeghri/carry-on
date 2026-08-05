@@ -73,6 +73,7 @@ session through the whole cycle:
 | `[● CARRY-ON — waiting for reset]` | this session hit the limit, queued to wake |
 | `[● CARRY-ON — resuming…]` | a headless resume of this session is running now |
 | `[● CARRY-ON — resumed · reload]` | resumed — reattach to see the continued work |
+| `[● CARRY-ON — chained · start fresh]` | deliberately not resumed — [too cold to be worth it, or policy](#cache-economy-why-cold-resumes-are-expensive) |
 
 The badge is per-session — it shows only where carry-on is armed, nothing
 in other sessions. Because a headless resume writes to the session's
@@ -121,10 +122,13 @@ popup we'd have to caveat.) Every catch, wait, and resume is still recorded to
    actually lifted — a still-limited probe fails **free** and usually carries
    a fresh reset time to re-sleep on. The new window is never burned on a
    guess.
-4. **Resume.** For each pending session:
+4. **Resume.** For each pending session, newest catch first:
    `claude --resume <id> -p "<continue prompt>"` from its original
-   directory, with its original permission mode. Output is logged, history
-   recorded, the badge flips to `resumed · reload`. The sleeper exits.
+   directory, with its original permission mode. Wakes are spaced (`wake_gap`,
+   default 3 min) so one reset isn't a herd, and a session too fat and too cold
+   to be worth reviving is [chained instead](#cache-economy-why-cold-resumes-are-expensive).
+   Output is logged, history recorded, the badge flips to `resumed · reload`.
+   The sleeper exits.
 
 Next time you open a session in that project, or reattach the resumed one,
 carry-on tells you what happened overnight:
@@ -133,13 +137,96 @@ carry-on tells you what happened overnight:
 carry-on: session f34907ab in this project was resumed after a limit reset — carry-on log f34907ab
 ```
 
+## Cache economy: why cold resumes are expensive
+
+A resume is not free, and its price is not the work it does.
+
+Claude's prompt cache expires after roughly an hour. Every limit wait is longer
+than that, so a resumed session re-primes its **entire transcript** as
+cache-creation tokens on its very first turn, before any work happens. A fresh
+`claude` boot costs 40–90k tokens. A 21-hour-old session with a fat transcript
+was measured writing **1.1M cache tokens in two minutes** on wake — reviving it
+cost about ten times what starting a new session in the same directory would
+have. And when a fleet's sessions all wait on the same reset, they all wake on
+the same second: two measured resets burned 4.6M and 2.4M tokens on cache
+writes alone, exhausting the fresh window in ~15 minutes.
+
+carry-on's core value is unchanged — a lean session resumed minutes after the
+reset keeps all its context for almost nothing. Three brakes protect it from
+the other end, all decided **from the filesystem, before anything talks to the
+API**. That timing is the whole point: the re-prime happens on the resumed
+session's first turn, so a rule the session reads *after* waking arrives after
+the bill.
+
+**1. Wakes are spaced.** Sessions freed by one reset launch `wake_gap` apart
+(default 3 min), newest catch first. Nothing is dropped — the herd is spread.
+
+**2. Cold and fat sessions are not resumed.** Before each wake carry-on stats
+the session's transcript. Resuming is skipped when it is **larger than
+`gate_transcript_bytes`** (default 2 MB) **and** demonstrably cold — idle past
+`gate_idle` (default 1h, the cache TTL) or older than `gate_age` (default 6h).
+
+**Read that default honestly: in practice it is a size gate.** Idle is measured
+from the moment the limit caught the session to the moment carry-on would
+resume it — and *every* limit wait is longer than the one-hour cache TTL, which
+is the whole reason this feature exists. So the cold test is nearly always
+satisfied, and the shipped default amounts to **"a transcript over 2 MB is not
+auto-resumed"**. That is deliberate: past the TTL the cache is gone whatever the
+session was doing, and size is what the re-prime bill is proportional to. Size
+is the dial you actually tune. Raise `gate_transcript_bytes` if you want fatter
+sessions revived anyway, or set it to `0` to switch the gate off entirely.
+
+Instead of resuming, carry-on writes a **chain-me signal**:
+
+```json
+// ~/.claude/carry-on/chain-me/<session-id>.json
+{ "session_id": "…", "cwd": "/path/to/project",
+  "reason": "transcript 3407872B > 2097152B, idle 14400s > 3600s",
+  "caught_at": 1754300000, "written_at": 1754314400, "wake": { … } }
+```
+
+An orchestrator (a fleet watchdog, a conductor) watches that directory and
+starts a **fresh** session in the same `cwd` — cheaper, and with a prompt cache
+that is actually warm. The wake is consumed so it never fires later, and the
+reason is in `carry-on status`, the history, and the notices. Set
+`gate_transcript_bytes` to `0` to switch the gate off.
+
+**3. Fleets can say up front which sessions may be resumed.** A fleet usually
+wants auto-resume for exactly *one* session per project — the orchestrator —
+because a worker's death is the dispatch chain's job:
+
+```
+carry-on mode chain          # this project: never resume, always chain-me
+carry-on mode resume         # …and drop `.carry-on` beside the orchestrator
+carry-on mode off <id>       # or pin one session
+```
+
+The policy lives in a one-word `.carry-on` file in the project (per-session
+pins live under `~/.claude/carry-on/modes/`), and every config key also accepts
+an environment override — `CARRY_ON_MODE=chain`, `CARRY_ON_WAKE_GAP=60` — so a
+spawner can give one session a policy without racing the shared config file.
+The policy is read **when the limit is caught**, so set it before a session
+dies; changing it afterwards does not retarget a wake already queued (drop that
+one with `carry-on cancel <id>`).
+
+**Interop.** A resume moves a live session to a new process, and a supervisor
+watching pids sees only the first half: the pid it knew is gone. carry-on
+appends the mapping to `~/.claude/carry-on/resumes.jsonl`
+(`{resumed_at, session_id, old_pid, new_pid}`) — check it before reporting a
+death.
+
+A gated session is **not** a resume: it spends no chain step and gets no
+window-handover stamp, so [chain decay](#trust--safety) sees exactly the state
+it would have seen had nothing happened.
+
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `/carry-on:status` (or `carry-on status`) | Pending wakes + recent history |
+| `/carry-on:status` (or `carry-on status`) | Pending wakes, chain-me signals, recent history |
 | `/carry-on:cancel <id\|all>` | Drop pending wake(s) |
 | `/carry-on:on` / `/carry-on:off` | Enable / disable catching |
+| `/carry-on:mode [m] [id]` | Per-project or per-session policy: `resume` \| `chain` \| `notify` \| `off` |
 | `/carry-on:statusline` | Wire the always-visible statusline badge |
 | `carry-on config mode notify` | Record-only: no auto-resume, signalled via the badge + `carry-on status` |
 | `carry-on log [id-prefix]` | Tail a resume's output log |
@@ -193,6 +280,12 @@ that session yourself.
   full window, so a spent budget can never bind forever. A day whose budget is already spent must never strand a
   window that has reopened. When the cap does bind, it binds on the STALEST
   pending: sessions are served newest-catch first.
+- **Bounded by what a resume is worth.** A session too fat to revive cheaply is
+  not revived at all — see [cache
+  economy](#cache-economy-why-cold-resumes-are-expensive). In practice that
+  means transcripts over 2 MB; a lean session is never gated, however long it
+  waited. Raise `gate_transcript_bytes`, or set it to `0`, if you would rather
+  pay the re-prime.
 - **Deny list.** `carry-on config deny "$HOME/sensitive*:$HOME/other*"`
   keeps chosen projects out entirely.
 - All state is plain files under `~/.claude/carry-on/` — read them any time.
@@ -201,15 +294,24 @@ that session yourself.
 ## Config
 
 `carry-on config` shows current values. Keys: `enabled` · `mode`
-(resume|notify) · `resume_prompt` · `max_chain` (3, rapid re-deaths before
+(resume|chain|notify) · `resume_prompt` · `max_chain` (3, rapid re-deaths before
 notify-only) · `chain_decay` (seconds, default 1h — gap that clears the
 chain) · `max_wait` (seconds, default 7 days) · `probe_model` (haiku) ·
 `daily_cap` (12 resumes per limit window, all sessions) ·
 `resume_default_mode` (acceptEdits|skip) ·
 `resume_bypass_mode` (bypass|acceptEdits — default bypass replays the original
 session's bypass for continuity; acceptEdits downgrades it, see the trust note) ·
+`wake_gap` (seconds between wakes at one reset, default 180; 0 disables) ·
+`gate_transcript_bytes` (2 MB; 0 disables the [cache-economy
+gate](#cache-economy-why-cold-resumes-are-expensive)) ·
+`gate_idle` (seconds, default 1h) · `gate_age` (seconds, default 6h) ·
 `deny`
 (colon-separated globs).
+
+Every key also reads from the environment, which outranks the file:
+`CARRY_ON_MODE`, `CARRY_ON_WAKE_GAP`, `CARRY_ON_GATE_IDLE`, and so on. Per
+project (or per session), `carry-on mode` writes a `.carry-on` policy file
+instead.
 
 ## Limits of scope
 

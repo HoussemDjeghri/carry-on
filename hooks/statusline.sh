@@ -5,6 +5,7 @@
 #   [● CARRY-ON — waiting for reset]   THIS session hit the limit, queued to wake
 #   [● CARRY-ON — resuming…]           a headless resume of THIS session is running now
 #   [● CARRY-ON — resumed · reload]    resumed; reattach (claude --resume) to see the work
+#   [● CARRY-ON — chained · start fresh]  not resumed on purpose (cost, or policy)
 # Nothing when disabled or in a session carry-on never armed. Session-scoped:
 # the SessionStart hook drops a per-session marker; no marker means no badge
 # (plugin off, or a session from another setup).
@@ -34,6 +35,11 @@ elif [ -f "$STATE/resumed/$sid" ]; then
   printf '\033[38;5;108m[● CARRY-ON — resumed · reload]\033[0m'
 elif [ -f "$STATE/pending/$sid.json" ]; then
   printf '\033[38;5;108m[● CARRY-ON — waiting for reset]\033[0m'
+elif [ -f "$STATE/chain-me/$sid.json" ]; then
+  # Deliberately not resumed — too cold and too fat to be worth re-priming, or
+  # a mode=chain policy. Without this the badge would drop silently back to
+  # plain "armed" and the session would look like it had simply been forgotten.
+  printf '\033[38;5;108m[● CARRY-ON — chained · start fresh]\033[0m'
 else
   printf '\033[38;5;108m[● CARRY-ON]\033[0m'
 fi

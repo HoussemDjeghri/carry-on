@@ -44,6 +44,10 @@ fresh_env() {
   export CARRY_ON_NOTIFY_LOG="$TESTDIR/notifications.log"
   export CARRY_ON_SLICE=1
   export CARRY_ON_FALLBACK_STEPS="2 2 2"
+  # The wake stagger is 3 minutes in production; every multi-resume test here
+  # would sit through it. Off by default, and switched on explicitly by the
+  # tests that measure it.
+  export CARRY_ON_WAKE_GAP=0
   export CLAUDE_BIN="$TESTDIR/bin/claude"
   # Isolate statusline wiring from the real ~/.claude — settings.json edits and
   # the drop-in dir must never touch the developer's machine during a test run.
@@ -95,6 +99,23 @@ case "$*" in
     # sleeper returns can prove it was cleared, which a marker that was never
     # written satisfies just as well.
     ls "$CARRY_ON_HOME/resuming" >> "$SHIM_STATE/resuming-during.log" 2>/dev/null
+    # A resume that is still RUNNING when the test wants to act on it. Publishes
+    # its own pid, so a test can prove the process itself died rather than
+    # inferring it from the sleeper's bookkeeping.
+    if [ -f "$SHIM_STATE/slow-resume" ]; then
+      printf '%s' "$$" > "$SHIM_STATE/resume-child.pid"
+      sleep 30
+    fi
+    # A resume that outlives its own TERM for a moment, so a test can observe
+    # the sleeper's state WHILE a killed resume is still winding down. `sleep &
+    # wait` deliberately, not a foreground sleep: a trapped signal interrupts
+    # `wait`, where a foreground command would defer the handler until it ended
+    # — the same bash fact the sleeper's own resume launch turns on.
+    if [ -f "$SHIM_STATE/stubborn-resume" ]; then
+      trap 'touch "$SHIM_STATE/child-signalled"; sleep 3; exit 143' TERM
+      printf '%s' "$$" > "$SHIM_STATE/resume-child.pid"
+      sleep 30 & wait $!
+    fi
     echo "resumed-and-continued"; exit "${SHIM_RESUME_EXIT:-0}" ;;
   *) echo "OK" ;;
 esac
@@ -776,6 +797,14 @@ check "resuming badge while a headless resume runs (beats waiting)" bash -c "pri
 rm -f "$CARRY_ON_HOME/resuming/s-line"
 rm -f "$CARRY_ON_HOME/pending/s-line.json"
 
+# A session carry-on deliberately did NOT resume says so, rather than dropping
+# silently back to plain "armed" as though it had been forgotten.
+mkdir -p "$CARRY_ON_HOME/chain-me"; echo '{}' > "$CARRY_ON_HOME/chain-me/s-line.json"
+out=$(spayload s-line | "$ROOT/hooks/statusline.sh")
+check "chained badge when the session was deliberately not resumed" \
+  bash -c "printf '%s' \"$out\" | grep -q 'chained'"
+rm -f "$CARRY_ON_HOME/chain-me/s-line.json"
+
 # After a resume → "resumed · reload" cues the still-open TUI to reattach.
 mkdir -p "$CARRY_ON_HOME/resumed"; : > "$CARRY_ON_HOME/resumed/s-line"
 out=$(spayload s-line | "$ROOT/hooks/statusline.sh")
@@ -1259,6 +1288,412 @@ check "a failure that merely carries a timestamp is not a limit" test "$ll_time"
 ( . "$ROOT/lib/parse-reset.sh"
   looks_limited "You've reached your model limit. Run /usage-credits to continue." ) && ll_real=yes || ll_real=no
 check "a real limit message with no reset time still reads as a limit" test "$ll_real" = yes
+
+# ═══════════════════ cache economy: stagger, gate, policy ═══════════════════
+# A wake is not free: a session idle past the prompt-cache TTL re-primes its
+# ENTIRE transcript as cache-creation tokens on its first turn. These cover the
+# three brakes — space the wakes, refuse the ones that cost more than they are
+# worth, and let a fleet say up front which sessions may be resumed at all.
+
+# Run a cache-economy function in isolation. The libraries are the unit here;
+# the sleeper integration is exercised further down.
+economy() { # economy FUNCTION ARGS...
+  ( . "$ROOT/lib/common.sh"; . "$ROOT/lib/cache-economy.sh"; "$@" )
+}
+
+# A transcript that looks like the real thing: untimestamped metadata first
+# (which is why the age probe scans a head rather than line 1), then JSONL
+# padded to size.
+fake_transcript() { # fake_transcript SESSION_ID BYTES [STARTED_ISO]
+  local dir="$CLAUDE_CONFIG_DIR/projects/-fake-proj" f pad
+  mkdir -p "$dir"
+  f="$dir/$1.jsonl"
+  printf '{"type":"mode","mode":"normal"}\n' > "$f"
+  [ -n "${3:-}" ] && printf '{"type":"user","timestamp":"%s"}\n' "$3" >> "$f"
+  pad='{"type":"assistant","text":"'$(printf 'x%.0s' $(seq 1 200))'"}'
+  yes "$pad" 2>/dev/null | head -c "$2" >> "$f"
+}
+
+echo "# cache economy: the gate's threshold logic"
+fresh_env
+r=$(economy gate_verdict 3145728 14400 0)
+check "fat + long idle trips the gate, and the reason names the size and the idle" \
+  bash -c "printf '%s' '$r' | grep -q 'transcript 3145728B > 2097152B' && printf '%s' '$r' | grep -q 'idle 14400s'"
+r=$(economy gate_verdict 3145728 60 86400)
+check "fat + old session trips the gate on age alone" bash -c "printf '%s' '$r' | grep -q 'age 86400s'"
+r=$(economy gate_verdict 3145728 60 60)
+check "fat but WARM is resumed — the case carry-on exists for" test -z "$r"
+r=$(economy gate_verdict 204800 99999 99999)
+check "lean is resumed however cold it got" test -z "$r"
+r=$(CARRY_ON_GATE_TRANSCRIPT_BYTES=0 economy gate_verdict 3145728 99999 99999)
+check "gate_transcript_bytes=0 disables the gate entirely" test -z "$r"
+r=$(CARRY_ON_GATE_IDLE=0 CARRY_ON_GATE_AGE=0 economy gate_verdict 3145728 99999 99999)
+check "size with both cold signals disabled never gates on its own" test -z "$r"
+r=$(economy gate_verdict 3145728 14400 86400)
+check "both cold signals report both, not the first one found" \
+  bash -c "printf '%s' '$r' | grep -q 'idle' && printf '%s' '$r' | grep -q 'age'"
+
+echo "# cache economy: transcript probes"
+fresh_env
+fake_transcript s-probe 4096 "2026-08-04T10:00:00.000Z"
+p=$(economy transcript_path s-probe)
+check "the transcript is found by session id, whatever the cwd munging" test -n "$p"
+size=$(economy file_size "$p")
+check "its size is read" test "$size" -gt 4000
+started=$(economy transcript_started_at "$p")
+check "session start comes from the first TIMESTAMPED line, past the metadata" \
+  bash -c "test '$started' -gt 0 && test \"\$(date -r $started -u +%Y-%m-%dT%H:%M 2>/dev/null || date -u -d @$started +%Y-%m-%dT%H:%M)\" = '2026-08-04T10:00'"
+fake_transcript s-nots 4096
+nots=$(economy transcript_started_at "$CLAUDE_CONFIG_DIR/projects/-fake-proj/s-nots.jsonl")
+check "a transcript with no timestamp leaves age UNKNOWN, it does not invent one" \
+  test "$nots" = 0
+economy transcript_path s-nowhere >/dev/null 2>&1 && found=yes || found=no
+check "a session with no transcript on disk cannot be gated" test "$found" = no
+
+echo "# cache economy: a cold fat session is chained, not resumed"
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+fake_transcript s-fat 3145728
+caught=$(( $(date +%s) - 14400 ))   # caught 4h ago: long past the prompt-cache TTL
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$caught" \
+  '{session_id:"s-fat", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t+1),
+    chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-fat.json"
+"$ROOT/lib/sleeper.sh"
+check "a 3MB transcript idle 4h is not resumed" \
+  bash -c "! grep -q -- '--resume s-fat' '$SHIM_STATE/calls.log' 2>/dev/null"
+check "the wake is consumed, not left to fire later" test ! -f "$CARRY_ON_HOME/pending/s-fat.json"
+check "a chain-me signal is written for a fresh successor" test -f "$CARRY_ON_HOME/chain-me/s-fat.json"
+check "the signal carries session, cwd, caught_at and the original wake" \
+  bash -c "jq -re '.session_id == \"s-fat\" and .cwd == \"$TESTDIR/proj\" and .caught_at == $caught and .written_at > 0 and .wake.session_id == \"s-fat\" and .wake.permission_mode == \"acceptEdits\"' '$CARRY_ON_HOME/chain-me/s-fat.json'"
+check "the reason names the thresholds that tripped, with values" \
+  bash -c "jq -re '.reason | test(\"transcript [0-9]+B > 2097152B\") and test(\"idle [0-9]+s > 3600s\")' '$CARRY_ON_HOME/chain-me/s-fat.json'"
+check "it is logged visibly, in history and in the notices" \
+  bash -c "grep -q '\"event\":\"chain_me\"' '$CARRY_ON_HOME/history.jsonl' && grep -q 'not resumed' '$CARRY_ON_NOTIFY_LOG'"
+# Composition with chain-decay: a session that was never resumed must not look
+# like one that was. Stamping the handover here would tell the catcher a fresh
+# window had been granted, and a gated session would silently decay the chain.
+check "a gated session spends no chain step and gets no window stamp" \
+  bash -c "test ! -f '$CARRY_ON_HOME/chains/s-fat' && test ! -f '$CARRY_ON_HOME/chains/s-fat.at'"
+check "carry-on status surfaces the signal" \
+  bash -c "'$ROOT/bin/carry-on' status | grep -q 'chain-me signals'"
+
+echo "# cache economy: a lean recent session still resumes exactly as before"
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+fake_transcript s-lean 204800
+caught=$(( $(date +%s) - 600 ))     # 10 minutes: cache still warm
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$caught" \
+  '{session_id:"s-lean", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t+1),
+    chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-lean.json"
+"$ROOT/lib/sleeper.sh"
+check "200KB idle 10min resumes, untouched by the gate" \
+  bash -c "grep -q -- '--resume s-lean' '$SHIM_STATE/calls.log' && test ! -f '$CARRY_ON_HOME/chain-me/s-lean.json'"
+
+# A signal is advice about a session, not a permanent label on it. Once the
+# session carries on — resumed here, reattached below — the advice is WRONG, and
+# nothing else ever cleared it: it held the badge at "chained · start fresh" and
+# sat in `carry-on status` recommending a successor for a month.
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" \
+  "$CARRY_ON_HOME/daily" "$CARRY_ON_HOME/chain-me"
+echo '{"session_id":"s-stale"}' > "$CARRY_ON_HOME/chain-me/s-stale.json"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-stale", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t-1),
+    chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-stale.json"
+"$ROOT/lib/sleeper.sh"
+check "a later successful resume retires the session's stale chain-me signal" \
+  bash -c "grep -q -- '--resume s-stale' '$SHIM_STATE/calls.log' && test ! -f '$CARRY_ON_HOME/chain-me/s-stale.json'"
+
+fresh_env
+mkdir -p "$CARRY_ON_HOME/chain-me"
+echo '{"session_id":"s-back2"}' > "$CARRY_ON_HOME/chain-me/s-back2.json"
+printf '{"session_id":"s-back2","cwd":"%s"}' "$TESTDIR/proj" | "$ROOT/hooks/session-start.sh" >/dev/null
+reap
+check "the user reattaching retires it too — the successor it asked for is moot" \
+  test ! -f "$CARRY_ON_HOME/chain-me/s-back2.json"
+
+echo "# cache economy: the wake stagger"
+fresh_env
+export CARRY_ON_WAKE_GAP=60
+mkdir -p "$CARRY_ON_HOME"
+# Five hooks claiming at once — the exact race the shared reservation exists
+# for. Two claimants concluding "I'm first" is the herd this feature removes.
+for _ in 1 2 3 4 5; do
+  ( printf '%s\n' "$(economy stagger_claim)" ) >> "$TESTDIR/slots.txt" &
+done
+wait
+check "five racing claims reserve five DISTINCT slots" \
+  bash -c "test \"\$(sort -u '$TESTDIR/slots.txt' | wc -l | tr -d ' ')\" = 5"
+check "the slots are exactly one gap apart, first one immediate" \
+  bash -c "s=\$(sort -n '$TESTDIR/slots.txt'); f=\$(printf '%s' \"\$s\" | head -1); l=\$(printf '%s' \"\$s\" | tail -1); now=\$(date +%s); test \$((l - f)) = 240 && test \"\$f\" -le \"\$now\""
+r=$(CARRY_ON_WAKE_GAP=0 economy stagger_claim)
+check "wake_gap=0 disables the stagger — every claim is immediate" \
+  bash -c "now=\$(date +%s); test \"$r\" -ge \$((now - 5)) && test \"$r\" -le \$((now + 5))"
+export CARRY_ON_WAKE_GAP=0
+
+echo "# cache economy: the wake-slot lock"
+# The reservation's whole job is that two claimants never conclude "I'm first".
+# A lock that is stolen on a timer alone breaks exactly that: six processes
+# forking at once on a loaded machine is this feature's NORMAL case, and a
+# holder that is merely slow would have its slot handed to someone else.
+fresh_env
+export CARRY_ON_WAKE_GAP=60
+mkdir -p "$CARRY_ON_HOME"
+sleep 30 & holder=$!
+printf '%s' "$holder" > "$CARRY_ON_HOME/wake-slot.lock"
+printf '%s' 4242424242 > "$CARRY_ON_HOME/wake-slot"   # a reservation it must not touch
+slot=$(economy stagger_claim)
+check "a lock held by a LIVE process is never stolen — 'slow' is not 'dead'" \
+  bash -c "test \"\$(cat '$CARRY_ON_HOME/wake-slot.lock' 2>/dev/null)\" = '$holder'"
+# …and the wake still happens. This lock guards an optimisation; a resume that
+# never fired because a lock file could not be taken would be the worse bug.
+check "a lock it cannot take degrades the stagger, it never blocks the resume" \
+  bash -c "now=\$(date +%s); test -n '$slot' && test '$slot' -ge \$((now - 60)) && test '$slot' -le \$((now + 5))"
+# But it must not write the shared queue unprotected on the way out. Every
+# giver-up would read the same value and write the same slot back — one instant
+# for all of them, and a reservation none of them respected left behind to
+# mis-stagger everyone after. That is the herd, restored by the fallback.
+check "a claim that could not lock leaves the shared reservation untouched" \
+  bash -c "test \"\$(cat '$CARRY_ON_HOME/wake-slot')\" = 4242424242"
+kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+
+# A pid naming no live process — obtained BEFORE the test directory exists.
+# This suite traps EXIT, so bash keeps a subshell alive to run the handler
+# instead of exec'ing the background command, and killing that job fires
+# `cleanup` inside it: every registered test directory is deleted, including
+# the one this fixture is about to write into. Planting the lock afterwards
+# then failed with ENOENT, and `test ! -f` below was satisfied by a lock that
+# had never existed — the check passed while proving nothing.
+sleep 5 & dead=$!; kill "$dead" 2>/dev/null; wait "$dead" 2>/dev/null
+fresh_env
+export CARRY_ON_WAKE_GAP=60
+mkdir -p "$CARRY_ON_HOME"
+printf '%s' "$dead" > "$CARRY_ON_HOME/wake-slot.lock"
+# The fixture asserts itself. A planting that silently failed leaves `test ! -f`
+# trivially true below, and the check would pass while proving nothing — which
+# is exactly what it did until this line was added.
+check "fixture: a lock naming a dead holder was really planted" \
+  test -f "$CARRY_ON_HOME/wake-slot.lock"
+slot=$(economy stagger_claim)
+check "a lock naming a DEAD holder is stolen, not queued behind forever" \
+  bash -c "test -n '$slot' && test ! -f '$CARRY_ON_HOME/wake-slot.lock'"
+export CARRY_ON_WAKE_GAP=0
+
+echo "# sleeper: SIGTERM while a resume is in flight"
+# `wait` is interruptible by a trapped signal — the foreground command it
+# replaced was not. Without the handler taking the child with it, a terminated
+# sleeper leaves a headless resume running unsupervised with its pending still
+# on disk, and the next ensure_sleeper starts a SECOND resume of that session.
+fresh_env
+touch "$SHIM_STATE/reset-done" "$SHIM_STATE/slow-resume"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-term", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t-1),
+    chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-term.json"
+"$ROOT/lib/sleeper.sh" & term_sleeper=$!
+# Wait for the resume to be genuinely in flight — never a guessed sleep.
+for _ in $(seq 100); do [ -s "$SHIM_STATE/resume-child.pid" ] && break; sleep 0.2; done
+term_child=$(cat "$SHIM_STATE/resume-child.pid" 2>/dev/null || echo 0)
+kill -TERM "$term_sleeper" 2>/dev/null
+for _ in $(seq 40); do kill -0 "$term_sleeper" 2>/dev/null || break; sleep 0.25; done
+wait "$term_sleeper" 2>/dev/null
+check "a terminated sleeper takes its in-flight resume with it, never orphans it" \
+  bash -c "test '$term_child' -gt 0 && ! kill -0 '$term_child' 2>/dev/null"
+check "the pending survives — the session was not resumed, so it is still owed one" \
+  test -f "$CARRY_ON_HOME/pending/s-term.json"
+check "the 'resuming…' marker is cleared, not left claiming a run that is over" \
+  test ! -f "$CARRY_ON_HOME/resuming/s-term"
+rm -f "$SHIM_STATE/slow-resume"
+
+# …and it holds its CLAIM until that child is actually gone. The lock is the
+# only thing stopping ensure_sleeper from starting a second sleeper, and the
+# pending is deliberately left on disk — so dropping the lock while the killed
+# resume was still winding down let a fresh sleeper relaunch the same session
+# beside a process still writing its transcript.
+fresh_env
+touch "$SHIM_STATE/reset-done" "$SHIM_STATE/stubborn-resume"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-lockorder", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t-1),
+    chain:0, caught_at:$t, retries:0, notify_only:false}' \
+  > "$CARRY_ON_HOME/pending/s-lockorder.json"
+"$ROOT/lib/sleeper.sh" & order_sleeper=$!
+for _ in $(seq 100); do [ -s "$SHIM_STATE/resume-child.pid" ] && break; sleep 0.2; done
+kill -TERM "$order_sleeper" 2>/dev/null
+# Wait for the evidence the child was signalled, never a guessed sleep. It then
+# lingers ~3s, which is the window this assertion has to land in.
+for _ in $(seq 100); do [ -f "$SHIM_STATE/child-signalled" ] && break; sleep 0.1; done
+check "the claim is held until the killed resume is actually gone" \
+  test -d "$CARRY_ON_HOME/sleeper.lock"
+for _ in $(seq 80); do kill -0 "$order_sleeper" 2>/dev/null || break; sleep 0.25; done
+wait "$order_sleeper" 2>/dev/null
+check "…and released once it is, so the next sleeper may take over" \
+  test ! -d "$CARRY_ON_HOME/sleeper.lock"
+rm -f "$SHIM_STATE/stubborn-resume"
+
+echo "# cache economy: one reset, several sessions"
+fresh_env
+# Four, asserted at three. The wait is sliced a second at a time (so a cancel
+# is not deferred for the whole gap, and a suspend cannot oversleep it), which
+# lets a wake overshoot its slot by up to a second — and launch stamps are whole
+# seconds, so a gap of N can legitimately read as N-1. Asserting the gap exactly
+# would be measuring that jitter; asserting one less still fails the moment the
+# stagger is removed, which is what the check is for.
+export CARRY_ON_WAKE_GAP=4
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+now=$(date +%s)
+for spec in "s-q-old 300" "s-q-mid 200" "s-q-new 100"; do
+  set -- $spec
+  jq -cn --arg id "$1" --arg cwd "$TESTDIR/proj" --argjson t "$((now - $2))" \
+    '{session_id:$id, cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t+1),
+      chain:0, caught_at:$t, retries:0, notify_only:false}' \
+    > "$CARRY_ON_HOME/pending/$1.json"
+done
+"$ROOT/lib/sleeper.sh"
+export CARRY_ON_WAKE_GAP=0
+order=$(grep -o -- '--resume s-q-[a-z]*' "$SHIM_STATE/calls.log" | sed 's/--resume //' | tr '\n' ' ')
+check "wakes fire most-recently-caught first" test "$order" = "s-q-new s-q-mid s-q-old "
+_launched_at() { ls "$CARRY_ON_HOME/logs" | grep "^$1-" | head -1 | sed "s/^$1-//; s/\.log\$//"; }
+a=$(_launched_at s-q-new); b=$(_launched_at s-q-mid); c=$(_launched_at s-q-old)
+check "the wakes are spaced, not a herd — each at least a gap after the last" \
+  test $((b - a)) -ge 3 -a $((c - b)) -ge 3
+check "all three still resumed — staggering delays wakes, it never drops them" \
+  bash -c "test \"\$(grep -c -- '--resume s-q-' '$SHIM_STATE/calls.log')\" = 3"
+
+echo "# resume log: a resumed session's old pid maps to its new one"
+fresh_env
+touch "$SHIM_STATE/reset-done"
+mkdir -p "$CARRY_ON_HOME/pending" "$CARRY_ON_HOME/logs" "$CARRY_ON_HOME/chains" "$CARRY_ON_HOME/daily"
+jq -cn --arg cwd "$TESTDIR/proj" --argjson t "$(date +%s)" \
+  '{session_id:"s-pid", cwd:$cwd, permission_mode:"acceptEdits", reset_epoch:($t-1),
+    chain:0, caught_at:$t, retries:0, notify_only:false, pid:4242}' \
+  > "$CARRY_ON_HOME/pending/s-pid.json"
+# A line already in the log. With only ever ONE resume in the fixture, "the log
+# has one line" is satisfied identically by appending and by TRUNCATING, so the
+# append this test is named for went unmeasured. A supervisor reads this file
+# for history; a truncating writer would erase every earlier resume.
+printf '{"resumed_at":1,"session_id":"s-earlier","old_pid":1,"new_pid":2}\n' > "$CARRY_ON_HOME/resumes.jsonl"
+"$ROOT/lib/sleeper.sh"
+check "the resume log names both pids, so a supervisor stops reporting a false death" \
+  bash -c "jq -re 'select(.session_id == \"s-pid\") | .old_pid == 4242 and .new_pid > 0 and .resumed_at > 0' '$CARRY_ON_HOME/resumes.jsonl' | grep -qx true"
+check "the new pid is the resume process, not the sleeper's guess" \
+  bash -c "n=\$(jq -r 'select(.session_id==\"s-pid\") | .new_pid' '$CARRY_ON_HOME/resumes.jsonl'); test \"\$n\" != 4242 && test \"\$n\" -gt 0"
+check "the log is append-only — an earlier entry survives a later resume" \
+  bash -c "test \"\$(wc -l < '$CARRY_ON_HOME/resumes.jsonl' | tr -d ' ')\" = 2 && grep -q s-earlier '$CARRY_ON_HOME/resumes.jsonl'"
+
+echo "# per-session resume policy"
+fresh_env
+printf 'chain\n' > "$TESTDIR/proj/.carry-on"
+payload s-policy-chain "$TESTDIR/proj" acceptEdits | "$ROOT/hooks/stop-failure.sh"
+# BEFORE reap, which removes the lock dir itself — asserting after it made this
+# unconditionally true and the check proved nothing.
+check "no sleeper is spawned for a session that will never be resumed" \
+  test ! -d "$CARRY_ON_HOME/sleeper.lock"
+reap
+check "mode=chain never queues a wake — it signals for a fresh successor" \
+  bash -c "test ! -f '$CARRY_ON_HOME/pending/s-policy-chain.json' && test -f '$CARRY_ON_HOME/chain-me/s-policy-chain.json'"
+check "the chain-me signal says the policy sent it, not a threshold" \
+  bash -c "jq -re '.reason == \"policy: mode=chain\" and .wake.cwd == \"$TESTDIR/proj\"' '$CARRY_ON_HOME/chain-me/s-policy-chain.json'"
+
+fresh_env
+printf 'off\n' > "$TESTDIR/proj/.carry-on"
+payload s-policy-off "$TESTDIR/proj" acceptEdits | "$ROOT/hooks/stop-failure.sh"
+reap
+check "mode=off tracks nothing at all — no wake, no signal" \
+  bash -c "test ! -f '$CARRY_ON_HOME/pending/s-policy-off.json' && test ! -f '$CARRY_ON_HOME/chain-me/s-policy-off.json'"
+
+fresh_env
+printf 'notify\n' > "$TESTDIR/proj/.carry-on"
+payload s-policy-notify "$TESTDIR/proj" acceptEdits | "$ROOT/hooks/stop-failure.sh"
+reap
+check "mode=notify keeps the wake but marks it notify-only" \
+  bash -c "jq -re '.notify_only == true' '$CARRY_ON_HOME/pending/s-policy-notify.json'"
+
+fresh_env
+printf 'chain\n' > "$TESTDIR/proj/.carry-on"
+mkdir -p "$CARRY_ON_HOME/modes"; printf 'resume\n' > "$CARRY_ON_HOME/modes/s-policy-pin"
+payload s-policy-pin "$TESTDIR/proj" acceptEdits | "$ROOT/hooks/stop-failure.sh"
+reap
+check "a session's own policy outranks the project's" \
+  bash -c "test -f '$CARRY_ON_HOME/pending/s-policy-pin.json'"
+
+# Precedence alone left the pin's own EFFECT untested: every assertion above
+# passes for a pin that is read and then ignored.
+fresh_env
+mkdir -p "$CARRY_ON_HOME/modes"; printf 'chain\n' > "$CARRY_ON_HOME/modes/s-policy-pinchain"
+payload s-policy-pinchain "$TESTDIR/proj" acceptEdits | "$ROOT/hooks/stop-failure.sh"
+reap
+check "a session pinned to chain really chains — no wake, a signal instead" \
+  bash -c "test ! -f '$CARRY_ON_HOME/pending/s-policy-pinchain.json' && jq -re '.reason == \"policy: mode=chain\"' '$CARRY_ON_HOME/chain-me/s-policy-pinchain.json'"
+
+fresh_env
+printf 'nonsense\n' > "$TESTDIR/proj/.carry-on"
+payload s-policy-junk "$TESTDIR/proj" acceptEdits | "$ROOT/hooks/stop-failure.sh"
+reap
+check "an unreadable policy falls back to resume — it can hold the net back, never break it" \
+  bash -c "test -f '$CARRY_ON_HOME/pending/s-policy-junk.json'"
+
+fresh_env
+rm -f "$TESTDIR/proj/.carry-on"
+out=$(cd "$TESTDIR/proj" && "$ROOT/bin/carry-on" mode chain)
+check "carry-on mode writes the project's .carry-on file" \
+  bash -c "grep -qx chain '$TESTDIR/proj/.carry-on'"
+check "carry-on mode with no value reports what is in force" \
+  bash -c "test \"\$(cd '$TESTDIR/proj' && '$ROOT/bin/carry-on' mode)\" = chain"
+out=$("$ROOT/bin/carry-on" mode off s-pinned)
+check "carry-on mode <m> <id> pins one session" \
+  bash -c "grep -qx off '$CARRY_ON_HOME/modes/s-pinned'"
+check "carry-on mode rejects a value it does not implement" \
+  bash -c "! '$ROOT/bin/carry-on' mode sideways 2>/dev/null"
+check "carry-on mode rejects a session id that is a path" \
+  bash -c "! '$ROOT/bin/carry-on' mode off '../../etc/passwd' 2>/dev/null"
+
+echo "# config: env outranks the file"
+fresh_env
+mkdir -p "$CARRY_ON_HOME"; echo "wake_gap=999" > "$CARRY_ON_HOME/config"
+check "an env override beats the shared config file" \
+  bash -c "test \"\$(CARRY_ON_WAKE_GAP=7 bash -c '. \"$ROOT/lib/common.sh\"; cfg_wake_gap')\" = 7"
+check "without the env var the file still rules" \
+  bash -c "test \"\$(env -u CARRY_ON_WAKE_GAP bash -c '. \"$ROOT/lib/common.sh\"; cfg_wake_gap')\" = 999"
+check "a non-numeric override falls back to the documented default, never to unlimited" \
+  bash -c "test \"\$(CARRY_ON_WAKE_GAP=soon bash -c '. \"$ROOT/lib/common.sh\"; cfg_wake_gap')\" = 180"
+
+echo "# external contract: the pending shape consumers glob and cancel"
+fresh_env
+payload s-contract "$TESTDIR/proj" acceptEdits | "$ROOT/hooks/stop-failure.sh"
+reap
+check "a pending still carries every field the documented shape promised" \
+  bash -c "jq -re 'has(\"session_id\") and has(\"cwd\") and has(\"permission_mode\") and has(\"reset_epoch\") and has(\"chain\") and has(\"caught_at\") and has(\"retries\") and has(\"notify_only\")' '$CARRY_ON_HOME/pending/s-contract.json'"
+check "the new field is additive" \
+  bash -c "jq -re 'has(\"pid\")' '$CARRY_ON_HOME/pending/s-contract.json'"
+check "carry-on cancel <id> still retires it" \
+  bash -c "'$ROOT/bin/carry-on' cancel s-contract >/dev/null && test ! -f '$CARRY_ON_HOME/pending/s-contract.json'"
+
+# The wake record is built with jq and written with printf, and printf cannot
+# fail — so a jq that died would publish an EMPTY file into the very directory
+# a watchdog globs, where nothing downstream can tell it from a real claim.
+fresh_env
+mkdir -p "$TESTDIR/wrapbin"
+printf '#!/bin/bash\ncase "$*" in *notify_only*) exit 1 ;; esac\nexec %s "$@"\n' "$(command -v jq)" \
+  > "$TESTDIR/wrapbin/jq"
+chmod +x "$TESTDIR/wrapbin/jq"
+# The export has to cover the HOOK, not just the payload — a `VAR=x cmd | hook`
+# prefix applies only to the left of the pipe, and the hook is what runs jq.
+( export PATH="$TESTDIR/wrapbin:$PATH"
+  payload s-torn "$TESTDIR/proj" acceptEdits | "$ROOT/hooks/stop-failure.sh" )
+reap
+check "a wake record that could not be built is never published as a pending" \
+  bash -c "test ! -e '$CARRY_ON_HOME/pending/s-torn.json'"
+check "…and the catch says so rather than failing silently" \
+  bash -c "grep -q 'NOT queued' '$CARRY_ON_NOTIFY_LOG'"
 
 # ───────────────────────── notify: no desktop popup ─────────────────────────
 echo "# notify"

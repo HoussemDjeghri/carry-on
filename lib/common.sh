@@ -8,6 +8,25 @@ LOGS_DIR="$CARRY_ON_HOME/logs"
 CHAINS_DIR="$CARRY_ON_HOME/chains"
 LASTSEEN_DIR="$CARRY_ON_HOME/lastseen"
 DAILY_DIR="$CARRY_ON_HOME/daily"
+# A session carry-on will NOT resume — because its policy says so, or because
+# resuming it would cost more than it is worth — leaves a signal here instead,
+# for an orchestrator to start a FRESH successor in the same cwd. One JSON file
+# per session id; nothing in carry-on ever consumes them.
+# shellcheck disable=SC2034
+CHAINME_DIR="$CARRY_ON_HOME/chain-me"
+# Per-session resume policy (resume|chain|notify|off), one word per file.
+# shellcheck disable=SC2034
+MODES_DIR="$CARRY_ON_HOME/modes"
+# Append-only JSONL mapping a resumed session's old pid to the new one, for
+# supervisors that watch pids. See resume_log_append.
+# shellcheck disable=SC2034
+RESUME_LOG="$CARRY_ON_HOME/resumes.jsonl"
+# Wake-stagger reservation: the epoch of the next free launch slot, plus the
+# lock that makes claiming one atomic across processes. See stagger_claim.
+# shellcheck disable=SC2034
+STAGGER_FILE="$CARRY_ON_HOME/wake-slot"
+# shellcheck disable=SC2034
+STAGGER_LOCK="$CARRY_ON_HOME/wake-slot.lock"
 # shellcheck disable=SC2034  # consumed by the SessionStart reporter
 SESSIONS_DIR="$CARRY_ON_HOME/sessions"
 # Badge lifecycle markers (per session id), consumed by the statusline + reporter:
@@ -42,7 +61,7 @@ SETTINGS_FILE="$CLAUDE_CFG_DIR/settings.json"
 
 ensure_dirs() {
   mkdir -p "$PENDING_DIR" "$LOGS_DIR" "$CHAINS_DIR" "$LASTSEEN_DIR" "$DAILY_DIR" \
-    "$SESSIONS_DIR" "$RESUMING_DIR" "$RESUMED_DIR"
+    "$SESSIONS_DIR" "$RESUMING_DIR" "$RESUMED_DIR" "$CHAINME_DIR" "$MODES_DIR"
 }
 
 pending_exists() {
@@ -98,23 +117,34 @@ ensure_sleeper() { # ensure_sleeper PLUGIN_ROOT
 
 # Config is KEY=VALUE lines, read with grep — never sourced, so a config
 # file can't execute code.
+#
+# An environment variable of the same name outranks the file: `CARRY_ON_MODE`,
+# `CARRY_ON_WAKE_GAP`, `CARRY_ON_GATE_IDLE`… That is how a fleet gives one
+# spawned session a policy of its own without racing every other session for
+# the single shared config file, and how the test suite pins a value a test
+# fixture would otherwise truncate away.
 config_get() { # config_get KEY DEFAULT
-  local val
-  val=$(grep -E "^$1=" "$CONFIG_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)
+  local val env_name
+  env_name="CARRY_ON_$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+  val="${!env_name-}"
+  [ -n "$val" ] || val=$(grep -E "^$1=" "$CONFIG_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)
   printf '%s' "${val:-$2}"
 }
 
-# A count read back from disk, or the fallback when the file holds anything that
-# is not one. These files are documented as user-readable, and `echo N > file` is
-# not atomic — a kill, a reboot or a full disk can leave one zero-length or torn.
-# An empty string then flows into `[ "$n" -ge … ]`, which THROWS and takes a
-# branch nobody chose, or into jq's --argjson, which rejects it and silently
-# skips the write that was the whole point of the call.
+# A whole number, or the fallback when the value in hand is anything else. An
+# empty string flows into `[ "$n" -ge … ]`, which THROWS and takes a branch
+# nobody chose, and into jq's --argjson, which rejects it and silently skips the
+# write that was the whole point of the call — so every number crossing a
+# boundary (a file, the config, a JSON field) passes through here first.
+int_or() { # int_or VALUE DEFAULT
+  case "$1" in "" | *[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$1" ;; esac
+}
+
+# A count read back from disk. These files are documented as user-readable, and
+# `echo N > file` is not atomic — a kill, a reboot or a full disk can leave one
+# zero-length or torn.
 read_int() { # read_int FILE [DEFAULT]
-  local n
-  n=$(cat "$1" 2>/dev/null || printf '%s' "${2:-0}")
-  case "$n" in "" | *[!0-9]*) n="${2:-0}" ;; esac
-  printf '%s' "$n"
+  int_or "$(cat "$1" 2>/dev/null || true)" "${2:-0}"
 }
 
 # The same reading applied to config, which is a user-edited file of strings.
@@ -122,10 +152,7 @@ read_int() { # read_int FILE [DEFAULT]
 # UNLIMITED, the exact opposite of what a cap is for. Every numeric key gets the
 # documented default rather than the failure-open branch.
 config_int() { # config_int KEY DEFAULT
-  local n
-  n=$(config_get "$1" "$2")
-  case "$n" in "" | *[!0-9]*) n="$2" ;; esac
-  printf '%s' "$n"
+  int_or "$(config_get "$1" "$2")" "$2"
 }
 
 # Is PID our sleeper? Liveness alone does not answer that, and every caller here
@@ -173,6 +200,18 @@ cfg_resume_default_mode() { config_get resume_default_mode acceptEdits; }
 # `acceptEdits` to downgrade instead: safer (no auto-approval of arbitrary
 # commands) but the resume then can't run non-edit tools either.
 cfg_resume_bypass_mode() { config_get resume_bypass_mode bypass; }
+# ── cache economy (see lib/cache-economy.sh) ──────────────────────────────
+# Seconds between consecutive wakes at one reset. Six sessions waking together
+# re-prime six cold transcripts in the same instant; spacing them keeps the
+# window's first minutes for work. 0 disables the stagger.
+cfg_wake_gap()   { config_int wake_gap 180; }
+# Gate thresholds. Transcript size is the primary signal — re-prime cost is
+# proportional to it — and only counts when paired with evidence the prompt
+# cache is actually cold: idle past its TTL, or an age no window survives.
+# Any 0 disables that signal; gate_transcript_bytes=0 disables the gate.
+cfg_gate_bytes() { config_int gate_transcript_bytes 2097152; }   # 2 MB
+cfg_gate_idle()  { config_int gate_idle 3600; }                  # prompt-cache TTL
+cfg_gate_age()   { config_int gate_age 21600; }                  # one window + slack
 cfg_resume_prompt() {
   config_get resume_prompt "Resume work. Your previous turn was interrupted by a usage-limit reset, which has now lifted. Re-read your last message and the task you were on, then continue from the next incomplete step. Do not restart work already finished and do not wait for reconfirmation — carry on to completion."
 }
@@ -208,6 +247,55 @@ notify() { # notify MESSAGE
 claude_bin() {
   if [ -n "${CLAUDE_BIN:-}" ]; then printf '%s' "$CLAUDE_BIN"; return; fi
   command -v claude 2>/dev/null || printf '%s' "$HOME/.local/bin/claude"
+}
+
+# The resume policy in force for a session about to be caught, most specific
+# source first:
+#   1. the session's own mode  (carry-on mode <m> <session-id>)
+#   2. a `.carry-on` file in the project — one word, which is what a fleet drops
+#      beside a worker it spawns
+#   3. the global `mode` config
+# A fleet wants auto-resume for exactly ONE session per project (the
+# orchestrator); a worker's death is the dispatch chain's job, not carry-on's.
+#   resume — auto-resume (the default)
+#   chain  — never resume; signal an orchestrator to start a fresh successor
+#   notify — record the reset, leave the resume to a human
+#   off    — do not even track this session
+# An unreadable or unknown value reads as `resume`: the policy file is a way to
+# hold back the safety net, never a way to break it.
+session_mode() { # session_mode SESSION_ID CWD
+  local m=""
+  [ -n "${1:-}" ] && m=$(head -1 "$MODES_DIR/$1" 2>/dev/null | tr -d '[:space:]')
+  [ -n "$m" ] || { [ -n "${2:-}" ] && m=$(head -1 "$2/.carry-on" 2>/dev/null | tr -d '[:space:]'); }
+  [ -n "$m" ] || m=$(cfg_mode)
+  case "$m" in resume | chain | notify | off) printf '%s' "$m" ;; *) printf 'resume' ;; esac
+}
+
+# The dying session's own process. Hooks run as a grandchild of it (claude spawns
+# a shell, the shell runs the hook), so $PPID is usually that wrapper shell — a
+# number no supervisor watching `claude` processes would recognise. Walk up to
+# the nearest ancestor that IS claude; fall back to $PPID when the walk finds
+# none, which is still better than nothing for the resume log.
+session_pid() {
+  local p="$PPID" n=0
+  while [ "$n" -lt 6 ] && [ -n "$p" ] && [ "$p" -gt 1 ]; do
+    case "$(ps -o comm= -p "$p" 2>/dev/null)" in *claude*) printf '%s' "$p"; return 0 ;; esac
+    p=$(int_or "$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')" 0)
+    n=$((n + 1))
+  done
+  printf '%s' "$PPID"
+}
+
+# A resume moves a live session from one process to another, and an external
+# supervisor that watches pids sees only the first half: the pid it knew is gone,
+# so it reports a death that never happened. This append-only log is the mapping
+# — a supervisor checks it before believing a pid's disappearance.
+resume_log_append() { # resume_log_append SESSION_ID OLD_PID NEW_PID
+  ensure_dirs
+  jq -cn --arg id "$1" \
+    --argjson old "$(int_or "${2:-}" 0)" --argjson new "$(int_or "${3:-}" 0)" \
+    --argjson ts "$(now_epoch)" \
+    '{resumed_at: $ts, session_id: $id, old_pid: $old, new_pid: $new}' >> "$RESUME_LOG"
 }
 
 chain_count() { # chain_count SESSION_ID

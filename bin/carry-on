@@ -39,6 +39,22 @@ cmd_status() {
       "${id:0:8}" "$(basename "$cwd")" "$(fmt_time "$caught")" "${wake:-retry}" "$chain"
   done
   [ "$any" = 0 ] && echo "no pending wakes"
+  # Sessions carry-on deliberately did NOT resume. They are the one outcome with
+  # no pending file and no resume log to look at, so without this line the only
+  # trace of a gated session is the history tail.
+  any=0
+  for f in "$CHAINME_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    if [ "$any" = 0 ]; then
+      echo
+      echo "chain-me signals (not resumed — start a fresh session in the cwd):"
+      any=1
+    fi
+    printf '  %-10s %-20s %s\n' \
+      "$(jq -r '.session_id // "?" | .[0:8]' "$f")" \
+      "$(basename "$(jq -r '.cwd // ""' "$f")")" \
+      "$(jq -r '.reason // ""' "$f")"
+  done
   if [ -f "$HISTORY_FILE" ]; then
     echo
     echo "recent:"
@@ -106,8 +122,37 @@ _default_for() { # bash-3.2-safe defaults lookup (no case inside $())
     chain_decay) echo 3600 ;;
     resume_default_mode) echo acceptEdits ;;
     resume_bypass_mode) echo bypass ;;
+    wake_gap) echo 180 ;;
+    gate_transcript_bytes) echo 2097152 ;;
+    gate_idle) echo 3600 ;;
+    gate_age) echo 21600 ;;
     *) echo "" ;;
   esac
+}
+
+# Per-session / per-project resume policy. With no target it writes the
+# project's `.carry-on` file, which is what a fleet drops beside a worker it
+# spawns; with a session id it pins that one session.
+cmd_mode() {
+  local value="${1:-}" target="${2:-}"
+  # The id becomes a path below — same charset guard the hooks apply.
+  [ -n "$target" ] && case "$target" in *[!A-Za-z0-9._-]*) die "not a session id: '$target'" ;; esac
+  if [ -z "$value" ]; then
+    session_mode "$target" "$PWD"; echo
+    return
+  fi
+  case "$value" in
+    resume | chain | notify | off) ;;
+    *) die "mode is resume|chain|notify|off" ;;
+  esac
+  if [ -n "$target" ]; then
+    ensure_dirs
+    printf '%s\n' "$value" > "$MODES_DIR/$target"
+    echo "$value — session $target"
+  else
+    printf '%s\n' "$value" > "$PWD/.carry-on" || die "could not write $PWD/.carry-on"
+    echo "$value — $PWD (.carry-on)"
+  fi
 }
 
 cmd_config() {
@@ -115,20 +160,22 @@ cmd_config() {
   if [ -z "$key" ]; then
     banner
     local k
-    for k in mode max_chain chain_decay max_wait probe_model daily_cap resume_default_mode resume_bypass_mode deny; do
+    for k in mode max_chain chain_decay max_wait probe_model daily_cap \
+      resume_default_mode resume_bypass_mode wake_gap gate_transcript_bytes \
+      gate_idle gate_age deny; do
       echo "$k=$(config_get "$k" "$(_default_for "$k")")"
     done
     return
   fi
   [ -n "$value" ] || die "usage: carry-on config <key> <value>"
   case "$key" in
-    mode) case "$value" in resume|notify) ;; *) die "mode is resume|notify" ;; esac ;;
+    mode) case "$value" in resume|chain|notify) ;; *) die "mode is resume|chain|notify" ;; esac ;;
     resume_default_mode) case "$value" in acceptEdits|skip) ;; *) die "resume_default_mode is acceptEdits|skip" ;; esac ;;
     resume_bypass_mode) case "$value" in acceptEdits|bypass) ;; *) die "resume_bypass_mode is acceptEdits|bypass" ;; esac ;;
-    max_chain|chain_decay|max_wait|daily_cap)
+    max_chain|chain_decay|max_wait|daily_cap|wake_gap|gate_transcript_bytes|gate_idle|gate_age)
       case "$value" in "" | *[!0-9]*) die "$key must be a whole number, got '$value'" ;; esac ;;
     enabled|probe_model|deny|resume_prompt) ;;
-    *) die "unknown key '$key' (enabled mode resume_prompt max_chain chain_decay max_wait probe_model daily_cap resume_default_mode resume_bypass_mode deny)" ;;
+    *) die "unknown key '$key' (enabled mode resume_prompt max_chain chain_decay max_wait probe_model daily_cap resume_default_mode resume_bypass_mode wake_gap gate_transcript_bytes gate_idle gate_age deny)" ;;
   esac
   config_set "$key" "$value"
   echo "$key=$value"
@@ -202,6 +249,7 @@ case "${1:-help}" in
   on)      config_set enabled true;  echo "carry-on enabled" ;;
   off)     config_set enabled false; echo "carry-on disabled (pending wakes kept; carry-on cancel all to drop them)" ;;
   log)     shift; cmd_log "$@" ;;
+  mode)    shift; cmd_mode "$@" ;;
   config)  shift; cmd_config "$@" ;;
   statusline) cmd_statusline ;;
   help|--help|-h)
@@ -210,7 +258,9 @@ carry-on — auto-resume Claude Code sessions after usage-limit resets
   carry-on status              pending wakes + recent history
   carry-on cancel <id|all>     drop pending wake(s)
   carry-on on|off              enable / disable catching
-  carry-on config [key value]  show or set config (mode=resume|notify, ...)
+  carry-on mode [m] [id]       per-project (.carry-on) or per-session policy:
+                               resume | chain | notify | off
+  carry-on config [key value]  show or set config (mode=resume|chain|notify, ...)
   carry-on log [id-prefix]     tail a resume log
   carry-on statusline          wire the always-visible badge (drop-in, safe)
 EOF

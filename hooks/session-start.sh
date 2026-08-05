@@ -25,7 +25,12 @@ case "$session_id" in *[!A-Za-z0-9._-]*) session_id="" ;; esac
 if [ -n "$session_id" ] && [ "$(cfg_enabled)" = "true" ]; then
   ensure_dirs
   : > "$SESSIONS_DIR/$session_id"
-  find "$SESSIONS_DIR" "$RESUMED_DIR" "$RESUMING_DIR" -type f -mtime +30 -delete 2>/dev/null || true
+  # Chain-me signals are pruned on the same retention as the markers: carry-on
+  # never consumes them itself, so without this the directory — and the list
+  # `carry-on status` prints from it — grows for the life of the install. A
+  # month-old signal describes a session no orchestrator is going to succeed.
+  find "$SESSIONS_DIR" "$RESUMED_DIR" "$RESUMING_DIR" "$CHAINME_DIR" \
+    -type f -mtime +30 -delete 2>/dev/null || true
 fi
 
 # If THIS session was resumed headlessly while it was down, this reattach is
@@ -85,6 +90,16 @@ if [ -n "$session_id" ] && [ ! -f "$RESUMING_DIR/$session_id" ] &&
   [ -f "$PENDING_DIR/$session_id.json" ]; then
   rm -f "$PENDING_DIR/$session_id.json"
   history_append reattached "$session_id" "$cwd"
+fi
+
+# The same reasoning retires a chain-me signal. It asked an orchestrator to
+# start a FRESH successor because this session was not worth reviving — and
+# here the session is, revived by the user. Nothing else ever clears one: it
+# would hold the badge at "chained · start fresh" and sit in `carry-on status`
+# until the 30-day prune, advising a successor for a session already back.
+if [ -n "$session_id" ] && [ ! -f "$RESUMING_DIR/$session_id" ] &&
+  [ -f "$CHAINME_DIR/$session_id.json" ]; then
+  rm -f "$CHAINME_DIR/$session_id.json"
 fi
 
 # Reboot/crash recovery: a pending with no live sleeper gets one now.

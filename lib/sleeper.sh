@@ -9,6 +9,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/lib/common.sh"
 # shellcheck source=parse-reset.sh
 . "$ROOT/lib/parse-reset.sh"
+# shellcheck source=cache-economy.sh
+. "$ROOT/lib/cache-economy.sh"
 
 ensure_dirs
 mkdir "$LOCK_DIR" 2>/dev/null || true
@@ -39,7 +41,39 @@ finish() {
 # serving pendings with its claim released, so ensure_sleeper was free to start a
 # second one beside it. `carry-on cancel` only appeared to kill it because it also
 # removed the pendings, which made the loop self-exit a slice later.
-trap 'rm -rf "$LOCK_DIR"; exit 143' TERM INT
+#
+# The in-flight resume goes with us. `wait` is INTERRUPTIBLE by a trapped signal,
+# unlike the foreground command this used to be — bash used to defer the handler
+# until the resume finished. So a terminated sleeper would now leave a headless
+# resume running unsupervised with its pending still on disk, and the next hook
+# to call ensure_sleeper would start a SECOND resume of the same session, two
+# writers on one transcript. The pending is deliberately left alone: the session
+# was not resumed, and a later sleeper should still go back for it.
+RESUME_CHILD=""
+RESUME_ID=""
+#
+# The lock goes LAST, after the child is actually gone. The lock is the only
+# thing stopping ensure_sleeper from starting a second sleeper, and the pending
+# is deliberately left on disk — so releasing it while the killed child was
+# still winding down let a fresh sleeper pick that same pending up and launch a
+# second resume beside a process still writing the transcript. That is the
+# two-writers failure this handler exists to prevent, reintroduced by ordering.
+_terminate() {
+  local i=0
+  if [ -n "$RESUME_CHILD" ]; then
+    kill "$RESUME_CHILD" 2>/dev/null || true
+    # Bounded: a child that ignores TERM must not strand the lock forever
+    # either. Five seconds, then the claim is released regardless.
+    while [ "$i" -lt 50 ] && kill -0 "$RESUME_CHILD" 2>/dev/null; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+    [ -n "$RESUME_ID" ] && rm -f "$RESUMING_DIR/$RESUME_ID"
+  fi
+  rm -rf "$LOCK_DIR"
+  exit 143
+}
+trap _terminate TERM INT
 
 # Newest catch first. When the cap binds it has to bind on the STALEST pending,
 # and glob order spends it on whichever session id sorts first instead — a
@@ -213,14 +247,20 @@ resumed=0; failed=0; notified=0
 
 resume_one() { # resume_one PENDING_FILE
   local f="$1" id cwd pmode prompt out ts retries notify_only caught_before caught_now
+  local old_pid tpath bytes started now idle age reason slot child
   id=$(jq -r '.session_id // empty' "$f" 2>/dev/null)
   [ -n "$id" ] || { rm -f "$f"; return; }
   cwd=$(jq -r '.cwd // empty' "$f")
   pmode=$(jq -r '.permission_mode // "default"' "$f")
-  retries=$(jq -r '.retries // 0' "$f")
+  # Sanitised like its siblings below: it is compared with -lt, which THROWS on
+  # a torn or hand-edited pending and takes a branch nobody chose.
+  retries=$(int_or "$(jq -r '.retries // 0' "$f")" 0)
+  old_pid=$(int_or "$(jq -r '.pid // 0' "$f")" 0)
   # Remembered so the failure branch can tell "our run failed" from "the child
   # was caught by a fresh limit and re-queued while we ran". See there.
-  caught_before=$(jq -r '.caught_at // 0' "$f" 2>/dev/null || echo 0)
+  # Sanitised, because the gate below does arithmetic with it: a torn or absent
+  # field must read as 0 (idle unknown), not throw mid-decision.
+  caught_before=$(int_or "$(jq -r '.caught_at // 0' "$f" 2>/dev/null)" 0)
   notify_only=$(jq -r '.notify_only // false' "$f")
   prompt=$(cfg_resume_prompt)
 
@@ -268,6 +308,44 @@ resume_one() { # resume_one PENDING_FILE
     return
   fi
 
+  # Cache-economy gate. Reviving a cold, fat session re-primes its whole
+  # transcript as cache-creation tokens on the resumed session's first turn —
+  # roughly ten fresh boots' worth for a session that has been sitting for
+  # hours. Decided here, from the filesystem, because by the time the resumed
+  # session could read a rule about it the tokens are already spent.
+  #
+  # A gated session is NOT a resume, so nothing about the chain moves: no
+  # window handover is stamped and no chain step is spent. It never happened,
+  # and the next real limit death sees exactly the chain state it would have.
+  now=$(now_epoch)
+  if tpath=$(transcript_path "$id"); then
+    bytes=$(file_size "$tpath")
+    started=$(transcript_started_at "$tpath")
+    # Unknown reads as 0 — a missing stamp must drop its signal, never present
+    # itself as "idle since the epoch" and gate a session on nothing.
+    idle=0
+    age=0
+    [ "$caught_before" -gt 0 ] && idle=$((now - caught_before))
+    [ "$started" -gt 0 ] && age=$((now - started))
+    reason=$(gate_verdict "$bytes" "$idle" "$age")
+    if [ -n "$reason" ]; then
+      # Recheck the claim, exactly as the launch below does. Deciding not to
+      # resume takes a multi-megabyte read and a dozen subprocesses, and
+      # SessionStart retires a pending the instant the user brings that session
+      # back by hand. A reattach landing in that gap would have us telling an
+      # orchestrator to start a FRESH successor for a session the user is at
+      # that moment typing in — and nothing ever cleans a chain-me signal up,
+      # so the wrong advice would outlive the mistake by a month.
+      [ -f "$f" ] || return
+      write_chain_me "$id" "$cwd" "$reason" "$caught_before" "$(cat "$f")"
+      history_append chain_me "$id" "$cwd"
+      notify "carry-on: session ${id:0:8} not resumed — $reason. Chain-me signal written for a fresh successor in $(basename "$cwd"): $CHAINME_DIR/$id.json"
+      notified=$((notified + 1))
+      rm -f "$f"
+      return
+    fi
+  fi
+
   if [ "$(spend_count)" -ge "$(resume_cap)" ]; then
     history_append daily_capped "$id" "$cwd"
     notify "carry-on: resume cap ($(resume_cap)) reached — session ${id:0:8} left resumable, not auto-resumed"
@@ -275,6 +353,27 @@ resume_one() { # resume_one PENDING_FILE
     rm -f "$f"
     return
   fi
+
+  # Space this wake from the last one. Five sessions freed by one reset used to
+  # start their cold re-primes in the same instant, so the window's first
+  # minutes went entirely on cache writes; now they land wake_gap apart. The
+  # slot is reserved atomically, so a second sleeper — one can exist for a slice
+  # after a stolen lock — can never claim the same instant. Claimed here, after
+  # every path that decides NOT to resume, so a skipped session never spends a
+  # slot the next one is then made to wait for.
+  # Sliced against the wall clock, never one long sleep, for the same three
+  # reasons the main loop is: a single `sleep` oversleeps a laptop suspend, a
+  # trapped signal cannot interrupt a foreground command (so `carry-on cancel`
+  # would hang for the whole remaining gap — up to wake_gap, by default three
+  # minutes), and the pending file IS the claim, which SessionStart deletes the
+  # moment the user brings the session back by hand. Rechecking every slice
+  # means a session that came back mid-wait is dropped here rather than being
+  # stamped as having been handed a fresh window.
+  slot=$(stagger_claim)
+  while [ "$(now_epoch)" -lt "$slot" ]; do
+    [ -f "$f" ] || return
+    sleep 1
+  done
 
   ts=$(now_epoch)
   out="$LOGS_DIR/${id}-${ts}.log"
@@ -297,14 +396,41 @@ resume_one() { # resume_one PENDING_FILE
   # as user input and ended the pass after one session. The rest then waited for
   # a fresh billed probe each, and a resume holding bypass permissions was handed
   # absolute paths it never asked for. The CLI's own warning names this redirect.
-  if (cd "$cwd" && "$CLAUDE" --resume "$id" -p "$prompt" --permission-mode "$pmode") > "$out" 2>&1 < /dev/null; then
+  #
+  # Launched in the background and waited on, purely so the child's pid is
+  # knowable: a supervisor watching processes sees the session's ORIGINAL pid
+  # die while the session lives on under this one, and reports a death that
+  # never happened. resume_log_append records the mapping.
+  (cd "$cwd" && exec "$CLAUDE" --resume "$id" -p "$prompt" --permission-mode "$pmode") \
+    > "$out" 2>&1 < /dev/null &
+  # Published for the TERM/INT handler, which cannot see a local. Assigned
+  # straight from `$!` rather than through a local first: every statement
+  # between the fork and this line is a window in which a TERM finds no pid to
+  # kill and the resume escapes supervision entirely. See _terminate.
+  RESUME_CHILD=$!; RESUME_ID="$id"
+  child="$RESUME_CHILD"
+  if wait "$child"; then
+    # Settle FIRST, report second. The pending file is the claim, and a TERM
+    # landing inside the bookkeeping below used to leave a session recorded as
+    # resumed with its claim still on disk — so the next sleeper would resume an
+    # already-continued transcript, two writers on one session. Clearing the
+    # handler's pid in the same breath: the child is reaped, so there is nothing
+    # left for it to kill, and the number would soon name some unrelated process.
+    rm -f "$f"
+    RESUME_CHILD=""; RESUME_ID=""
+    # Any chain-me signal for this session is now WRONG: it told an orchestrator
+    # to start a fresh successor, and the session itself just carried on. Left
+    # behind it would sit in `carry-on status` for a month and put the badge
+    # back to "chained · start fresh" the next time the user reattached.
+    rm -f "$CHAINME_DIR/$id.json"
     resumed=$((resumed + 1)); history_append resumed "$id" "$cwd"
+    resume_log_append "$id" "$old_pid" "$child"
     chain_increment "$id"; spend_increment
     # The continued transcript is now on disk. Flag the still-open TUI to
     # reattach and see it; SessionStart clears this when the user reattaches.
     : > "$RESUMED_DIR/$id"
-    rm -f "$f"
   else
+    RESUME_CHILD=""; RESUME_ID=""
     # Transient failures (crash, network, a per-model bucket the probe's
     # small model doesn't share) get one bounded retry on the fallback
     # schedule before the pending is declared lost.
@@ -320,7 +446,7 @@ resume_one() { # resume_one PENDING_FILE
     #
     # This is the ordinary path for a long chain, not a corner: the whole point
     # of a resume is to run until the window closes again.
-    caught_now=$(jq -r '.caught_at // 0' "$f" 2>/dev/null || echo 0)
+    caught_now=$(int_or "$(jq -r '.caught_at // 0' "$f" 2>/dev/null)" 0)
     if [ ! -f "$f" ]; then
       : # cancelled mid-run; nothing of ours left to settle
     elif [ "$caught_now" != "$caught_before" ]; then
